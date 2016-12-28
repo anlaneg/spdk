@@ -1,7 +1,7 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright(c) 2015 Intel Corporation. All rights reserved.
+ *   Copyright (c) Intel Corporation.
  *   All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
@@ -31,8 +31,19 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+/** \file
+ * String utility functions
+ */
+
 #ifndef SPDK_STRING_H
 #define SPDK_STRING_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <stdarg.h>
+#include <stddef.h>
 
 /**
  * sprintf with automatic buffer allocation.
@@ -41,6 +52,69 @@
  * which should be passed to free() when no longer needed,
  * or NULL on failure.
  */
-char *sprintf_alloc(const char *format, ...) __attribute__((format(printf, 1, 2)));
+char *spdk_sprintf_alloc(const char *format, ...) __attribute__((format(printf, 1, 2)));
+
+/**
+ * vsprintf with automatic buffer allocation.
+ *
+ * The return value is the formatted string,
+ * which should be passed to free() when no longer needed,
+ * or NULL on failure.
+ */
+char *spdk_vsprintf_alloc(const char *format, va_list args);
+
+/**
+ * Convert string to lowercase in place.
+ *
+ * \param s String to convert to lowercase.
+ */
+char *spdk_strlwr(char *s);
+
+/**
+ * Parse a delimited string with quote handling.
+ *
+ * \param stringp Pointer to starting location in string. *stringp will be updated to point to the
+ * start of the next field, or NULL if the end of the string has been reached.
+ * \param delim Null-terminated string containing the list of accepted delimiters.
+ *
+ * \return Pointer to beginning of the current field.
+ *
+ * Note that the string will be modified in place to add the string terminator to each field.
+ */
+char *spdk_strsepq(char **stringp, const char *delim);
+
+/**
+ * Trim whitespace from a string in place.
+ *
+ * \param s String to trim.
+ */
+char *spdk_str_trim(char *s);
+
+/**
+ * Copy a string into a fixed-size buffer, padding extra bytes with a specific character.
+ *
+ * \param dst Pointer to destination fixed-size buffer to fill.
+ * \param src Pointer to source null-terminated string to copy into dst.
+ * \param size Number of bytes to fill in dst.
+ * \param pad Character to pad extra space in dst beyond the size of src.
+ *
+ * If src is longer than size, only size bytes will be copied.
+ */
+void spdk_strcpy_pad(void *dst, const char *src, size_t size, int pad);
+
+/**
+ * Find the length of a string that has been padded with a specific byte.
+ *
+ * \param str Right-padded string to find the length of.
+ * \param size Size of the full string pointed to by str, including padding.
+ * \param pad Character that was used to pad str up to size.
+ *
+ * \return Length of the non-padded portion of str.
+ */
+size_t spdk_strlen_pad(const void *str, size_t size, int pad);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

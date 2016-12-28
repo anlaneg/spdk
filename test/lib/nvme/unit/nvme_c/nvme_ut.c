@@ -1,7 +1,7 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright(c) 2010-2015 Intel Corporation. All rights reserved.
+ *   Copyright (c) Intel Corporation.
  *   All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
@@ -31,138 +31,156 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "CUnit/Basic.h"
+#include "spdk_cunit.h"
+
+#include "spdk/env.h"
 
 #include "nvme/nvme.c"
 
-char outbuf[OUTBUF_SIZE];
+#include "lib/nvme/unit/test_env.c"
 
-volatile int sync_start = 0;
-volatile int threads_pass = 0;
-volatile int threads_fail = 0;
-
-uint64_t nvme_vtophys(void *buf)
+int
+spdk_pci_nvme_enumerate(spdk_pci_enum_cb enum_cb, void *enum_ctx)
 {
-	return (uintptr_t)buf;
+	return -1;
+}
+
+struct spdk_pci_id
+spdk_pci_device_get_id(struct spdk_pci_device *pci_dev)
+{
+	struct spdk_pci_id pci_id;
+
+	memset(&pci_id, 0xFF, sizeof(pci_id));
+
+	return pci_id;
+}
+
+bool
+spdk_nvme_transport_available(enum spdk_nvme_transport_type trtype)
+{
+	return true;
+}
+
+struct spdk_nvme_ctrlr *nvme_transport_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
+		const struct spdk_nvme_ctrlr_opts *opts,
+		void *devhandle)
+{
+	return NULL;
 }
 
 int
-nvme_ctrlr_hw_reset(struct nvme_controller *ctrlr)
+nvme_transport_ctrlr_scan(const struct spdk_nvme_transport_id *trid,
+			  void *cb_ctx,
+			  spdk_nvme_probe_cb probe_cb,
+			  spdk_nvme_remove_cb remove_cb)
 {
 	return 0;
 }
 
 int
-nvme_ctrlr_construct(struct nvme_controller *ctrlr, void *devhandle)
+nvme_transport_ctrlr_attach(enum spdk_nvme_transport_type trtype,
+			    spdk_nvme_probe_cb probe_cb, void *cb_ctx,
+			    struct spdk_pci_addr *addr)
 {
 	return 0;
 }
 
 void
-nvme_ctrlr_destruct(struct nvme_controller *ctrlr)
+nvme_ctrlr_destruct(struct spdk_nvme_ctrlr *ctrlr)
 {
 }
 
 int
-nvme_ctrlr_start(struct nvme_controller *ctrlr)
+nvme_ctrlr_add_process(struct spdk_nvme_ctrlr *ctrlr, void *devhandle)
 {
 	return 0;
 }
 
-static void prepare_for_test(uint32_t max_io_queues)
+int
+nvme_ctrlr_process_init(struct spdk_nvme_ctrlr *ctrlr)
 {
-	struct nvme_driver *driver = &g_nvme_driver;
-
-	driver->max_io_queues = max_io_queues;
-	if (driver->ioq_index_pool != NULL) {
-		free(driver->ioq_index_pool);
-		driver->ioq_index_pool = NULL;
-	}
-	driver->ioq_index_pool_next = 0;
-	nvme_thread_ioq_index = -1;
-
-	sync_start = 0;
-	threads_pass = 0;
-	threads_fail = 0;
+	return 0;
 }
 
-static void *
-nvme_thread(void *arg)
+int
+nvme_ctrlr_start(struct spdk_nvme_ctrlr *ctrlr)
 {
-	int rc;
+	return 0;
+}
 
-	/* Try to synchronize the nvme_register_io_thread() calls
-	 *  as much as possible to ensure the mutex locking is tested
-	 *  correctly.
-	 */
-	while (sync_start == 0)
-		;
+void
+nvme_ctrlr_fail(struct spdk_nvme_ctrlr *ctrlr, bool hot_remove)
+{
+}
 
-	rc = nvme_register_io_thread();
-	if (rc == 0) {
-		__sync_fetch_and_add(&threads_pass, 1);
-	} else {
-		__sync_fetch_and_add(&threads_fail, 1);
-	}
+int
+spdk_uevent_connect(void)
+{
+	return 0;
+}
 
-	pthread_exit(NULL);
+int
+spdk_get_uevent(int fd, struct spdk_uevent *uevent)
+{
+	return 0;
+}
+
+void
+spdk_nvme_ctrlr_opts_set_defaults(struct spdk_nvme_ctrlr_opts *opts)
+{
+	memset(opts, 0, sizeof(*opts));
+}
+
+struct spdk_pci_addr
+spdk_pci_device_get_addr(struct spdk_pci_device *pci_dev)
+{
+	struct spdk_pci_addr pci_addr;
+
+	memset(&pci_addr, 0, sizeof(pci_addr));
+	return pci_addr;
+}
+
+int
+spdk_pci_addr_compare(const struct spdk_pci_addr *a1, const struct spdk_pci_addr *a2)
+{
+	return true;
+}
+
+void
+nvme_ctrlr_proc_get_ref(struct spdk_nvme_ctrlr *ctrlr)
+{
+	return;
+}
+
+void
+nvme_ctrlr_proc_put_ref(struct spdk_nvme_ctrlr *ctrlr)
+{
+	return;
+}
+
+int
+nvme_ctrlr_get_ref_count(struct spdk_nvme_ctrlr *ctrlr)
+{
+	return 0;
 }
 
 static void
-test1(void)
+test_opc_data_transfer(void)
 {
-	struct nvme_driver *driver = &g_nvme_driver;
-	int rc;
-	int last_index;
+	enum spdk_nvme_data_transfer xfer;
 
-	prepare_for_test(1);
+	xfer = spdk_nvme_opc_get_data_transfer(SPDK_NVME_OPC_FLUSH);
+	CU_ASSERT(xfer == SPDK_NVME_DATA_NONE);
 
-	CU_ASSERT(nvme_thread_ioq_index == -1);
+	xfer = spdk_nvme_opc_get_data_transfer(SPDK_NVME_OPC_WRITE);
+	CU_ASSERT(xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER);
 
-	rc = nvme_register_io_thread();
-	CU_ASSERT(rc == 0);
-	CU_ASSERT(nvme_thread_ioq_index >= 0);
-	CU_ASSERT(driver->ioq_index_pool_next == 1);
+	xfer = spdk_nvme_opc_get_data_transfer(SPDK_NVME_OPC_READ);
+	CU_ASSERT(xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST);
 
-	/* try to register thread again - this should fail */
-	last_index = nvme_thread_ioq_index;
-	rc = nvme_register_io_thread();
-	CU_ASSERT(rc != 0);
-	/* assert that the ioq_index was unchanged */
-	CU_ASSERT(nvme_thread_ioq_index == last_index);
-
-	nvme_unregister_io_thread();
-	CU_ASSERT(nvme_thread_ioq_index == -1);
-	CU_ASSERT(driver->ioq_index_pool_next == 0);
+	xfer = spdk_nvme_opc_get_data_transfer(SPDK_NVME_OPC_GET_LOG_PAGE);
+	CU_ASSERT(xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST);
 }
-
-static void
-test2(void)
-{
-	int num_threads = 16;
-	int i;
-	pthread_t td;
-
-	/*
-	 * Start 16 threads, but only simulate a maximum of 12 I/O
-	 *  queues.  12 threads should be able to successfully
-	 *  register, while the other 4 should fail.
-	 */
-	prepare_for_test(12);
-
-	for (i = 0; i < num_threads; i++) {
-		pthread_create(&td, NULL, nvme_thread, NULL);
-	}
-
-	sync_start = 1;
-
-	while ((threads_pass + threads_fail) < num_threads)
-		;
-
-	CU_ASSERT(threads_pass == 12);
-	CU_ASSERT(threads_fail == 4);
-}
-
 
 int main(int argc, char **argv)
 {
@@ -180,8 +198,7 @@ int main(int argc, char **argv)
 	}
 
 	if (
-		CU_add_test(suite, "test1", test1) == NULL
-		|| CU_add_test(suite, "test2", test2) == NULL
+		CU_add_test(suite, "test_opc_data_transfer", test_opc_data_transfer) == NULL
 	) {
 		CU_cleanup_registry();
 		return CU_get_error();

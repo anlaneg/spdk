@@ -1,7 +1,7 @@
 #
 #  BSD LICENSE
 #
-#  Copyright(c) 2010-2015 Intel Corporation. All rights reserved.
+#  Copyright (c) Intel Corporation.
 #  All rights reserved.
 #
 #  Redistribution and use in source and binary forms, with or without
@@ -31,10 +31,15 @@
 #  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-SPDK_ROOT_DIR := $(CURDIR)/..
+SPDK_ROOT_DIR := $(abspath $(CURDIR)/..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
-DIRS-y += memory util nvme
+DIRS-y += bdev conf copy cunit event json jsonrpc \
+          log env_dpdk net rpc trace util nvme nvmf scsi ioat
+ifeq ($(OS),Linux)
+DIRS-y += iscsi
+endif
+
 
 .PHONY: all clean $(DIRS-y)
 

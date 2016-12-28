@@ -1,7 +1,7 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright(c) 2010-2015 Intel Corporation. All rights reserved.
+ *   Copyright (c) Intel Corporation.
  *   All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
@@ -33,103 +33,171 @@
 
 #include "nvme_internal.h"
 
-static inline struct nvme_namespace_data *
-_nvme_ns_get_data(struct nvme_namespace *ns)
+static inline struct spdk_nvme_ns_data *
+_nvme_ns_get_data(struct spdk_nvme_ns *ns)
 {
 	return &ns->ctrlr->nsdata[ns->id - 1];
 }
 
+static
+int nvme_ns_identify_update(struct spdk_nvme_ns *ns)
+{
+	struct nvme_completion_poll_status	status;
+	struct spdk_nvme_ns_data		*nsdata;
+	int					rc;
+
+	nsdata = _nvme_ns_get_data(ns);
+	status.done = false;
+	rc = nvme_ctrlr_cmd_identify_namespace(ns->ctrlr, ns->id, nsdata,
+					       nvme_completion_poll_cb, &status);
+	if (rc != 0) {
+		return rc;
+	}
+
+	while (status.done == false) {
+		nvme_robust_mutex_lock(&ns->ctrlr->ctrlr_lock);
+		spdk_nvme_qpair_process_completions(ns->ctrlr->adminq, 0);
+		nvme_robust_mutex_unlock(&ns->ctrlr->ctrlr_lock);
+	}
+	if (spdk_nvme_cpl_is_error(&status.cpl)) {
+		/* This can occur if the namespace is not active. Simply zero the
+		 * namespace data and continue. */
+		memset(nsdata, 0, sizeof(*nsdata));
+		ns->stripe_size = 0;
+		ns->sector_size = 0;
+		ns->md_size = 0;
+		ns->pi_type = 0;
+		ns->sectors_per_max_io = 0;
+		ns->sectors_per_stripe = 0;
+		ns->flags = 0;
+		return 0;
+	}
+
+	ns->sector_size = 1 << nsdata->lbaf[nsdata->flbas.format].lbads;
+
+	ns->sectors_per_max_io = spdk_nvme_ns_get_max_io_xfer_size(ns) / ns->sector_size;
+	ns->sectors_per_stripe = ns->stripe_size / ns->sector_size;
+
+	ns->flags = 0x0000;
+
+	if (ns->ctrlr->cdata.oncs.dsm) {
+		ns->flags |= SPDK_NVME_NS_DEALLOCATE_SUPPORTED;
+	}
+
+	if (ns->ctrlr->cdata.vwc.present) {
+		ns->flags |= SPDK_NVME_NS_FLUSH_SUPPORTED;
+	}
+
+	if (ns->ctrlr->cdata.oncs.write_zeroes) {
+		ns->flags |= SPDK_NVME_NS_WRITE_ZEROES_SUPPORTED;
+	}
+
+	if (nsdata->nsrescap.raw) {
+		ns->flags |= SPDK_NVME_NS_RESERVATION_SUPPORTED;
+	}
+
+	ns->md_size = nsdata->lbaf[nsdata->flbas.format].ms;
+	ns->pi_type = SPDK_NVME_FMT_NVM_PROTECTION_DISABLE;
+	if (nsdata->lbaf[nsdata->flbas.format].ms && nsdata->dps.pit) {
+		ns->flags |= SPDK_NVME_NS_DPS_PI_SUPPORTED;
+		ns->pi_type = nsdata->dps.pit;
+		if (nsdata->flbas.extended)
+			ns->flags |= SPDK_NVME_NS_EXTENDED_LBA_SUPPORTED;
+	}
+	return rc;
+}
+
 uint32_t
-nvme_ns_get_id(struct nvme_namespace *ns)
+spdk_nvme_ns_get_id(struct spdk_nvme_ns *ns)
 {
 	return ns->id;
 }
 
+bool
+spdk_nvme_ns_is_active(struct spdk_nvme_ns *ns)
+{
+	const struct spdk_nvme_ns_data *nsdata = _nvme_ns_get_data(ns);
+
+	/*
+	 * According to the spec, Identify Namespace will return a zero-filled structure for
+	 *  inactive namespace IDs.
+	 * Check NCAP since it must be nonzero for an active namespace.
+	 */
+	return nsdata->ncap != 0;
+}
+
 uint32_t
-nvme_ns_get_max_io_xfer_size(struct nvme_namespace *ns)
+spdk_nvme_ns_get_max_io_xfer_size(struct spdk_nvme_ns *ns)
 {
 	return ns->ctrlr->max_xfer_size;
 }
 
 uint32_t
-nvme_ns_get_sector_size(struct nvme_namespace *ns)
+spdk_nvme_ns_get_sector_size(struct spdk_nvme_ns *ns)
 {
 	return ns->sector_size;
 }
 
 uint64_t
-nvme_ns_get_num_sectors(struct nvme_namespace *ns)
+spdk_nvme_ns_get_num_sectors(struct spdk_nvme_ns *ns)
 {
 	return _nvme_ns_get_data(ns)->nsze;
 }
 
 uint64_t
-nvme_ns_get_size(struct nvme_namespace *ns)
+spdk_nvme_ns_get_size(struct spdk_nvme_ns *ns)
 {
-	return nvme_ns_get_num_sectors(ns) * nvme_ns_get_sector_size(ns);
+	return spdk_nvme_ns_get_num_sectors(ns) * spdk_nvme_ns_get_sector_size(ns);
 }
 
 uint32_t
-nvme_ns_get_flags(struct nvme_namespace *ns)
+spdk_nvme_ns_get_flags(struct spdk_nvme_ns *ns)
 {
 	return ns->flags;
 }
 
-const struct nvme_namespace_data *
-nvme_ns_get_data(struct nvme_namespace *ns)
+enum spdk_nvme_pi_type
+spdk_nvme_ns_get_pi_type(struct spdk_nvme_ns *ns) {
+	return ns->pi_type;
+}
+
+bool
+spdk_nvme_ns_supports_extended_lba(struct spdk_nvme_ns *ns)
 {
+	return (ns->flags & SPDK_NVME_NS_EXTENDED_LBA_SUPPORTED) ? true : false;
+}
+
+uint32_t
+spdk_nvme_ns_get_md_size(struct spdk_nvme_ns *ns)
+{
+	return ns->md_size;
+}
+
+const struct spdk_nvme_ns_data *
+spdk_nvme_ns_get_data(struct spdk_nvme_ns *ns)
+{
+	nvme_ns_identify_update(ns);
 	return _nvme_ns_get_data(ns);
 }
 
-int
-nvme_ns_construct(struct nvme_namespace *ns, uint16_t id,
-		  struct nvme_controller *ctrlr)
+int nvme_ns_construct(struct spdk_nvme_ns *ns, uint16_t id,
+		      struct spdk_nvme_ctrlr *ctrlr)
 {
-	struct nvme_completion_poll_status	status;
-	struct nvme_namespace_data		*nsdata;
-	uint32_t				pci_devid;
-
-	nvme_assert(id > 0, ("invalid namespace id %d", id));
+	assert(id > 0);
 
 	ns->ctrlr = ctrlr;
 	ns->id = id;
 	ns->stripe_size = 0;
 
-	nvme_pcicfg_read32(ctrlr->devhandle, &pci_devid, 0);
-	if (pci_devid == INTEL_DC_P3X00_DEVID && ctrlr->cdata.vs[3] != 0) {
+	if (ctrlr->quirks & NVME_INTEL_QUIRK_STRIPING &&
+	    ctrlr->cdata.vs[3] != 0) {
 		ns->stripe_size = (1 << ctrlr->cdata.vs[3]) * ctrlr->min_page_size;
 	}
 
-	nsdata = _nvme_ns_get_data(ns);
-
-	status.done = false;
-	nvme_ctrlr_cmd_identify_namespace(ctrlr, id, nsdata,
-					  nvme_completion_poll_cb, &status);
-	while (status.done == false) {
-		nvme_qpair_process_completions(&ctrlr->adminq, 0);
-	}
-	if (nvme_completion_is_error(&status.cpl)) {
-		nvme_printf(ctrlr, "nvme_identify_namespace failed\n");
-		return ENXIO;
-	}
-
-	ns->sector_size = 1 << nsdata->lbaf[nsdata->flbas.format].lbads;
-
-	ns->sectors_per_max_io = nvme_ns_get_max_io_xfer_size(ns) / ns->sector_size;
-	ns->sectors_per_stripe = ns->stripe_size / ns->sector_size;
-
-	if (ctrlr->cdata.oncs.dsm) {
-		ns->flags |= NVME_NS_DEALLOCATE_SUPPORTED;
-	}
-
-	if (ctrlr->cdata.vwc.present) {
-		ns->flags |= NVME_NS_FLUSH_SUPPORTED;
-	}
-
-	return 0;
+	return nvme_ns_identify_update(ns);
 }
 
-void nvme_ns_destruct(struct nvme_namespace *ns)
+void nvme_ns_destruct(struct spdk_nvme_ns *ns)
 {
 
 }

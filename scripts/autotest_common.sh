@@ -1,17 +1,24 @@
 set -xe
 ulimit -c unlimited
 
-MAKECONFIG='CONFIG_DEBUG=y'
+export RUN_NIGHTLY=0
+
+MAKECONFIG='CONFIG_DEBUG=y CONFIG_WERROR=y'
+
+export UBSAN_OPTIONS=halt_on_error=1
 
 case `uname` in
 	FreeBSD)
 		DPDK_DIR=/usr/local/share/dpdk/x86_64-native-bsdapp-clang
 		MAKE=gmake
+		MAKEFLAGS=${MAKEFLAGS:--j$(sysctl -a | egrep -i 'hw.ncpu' | awk '{print $2}')}
 		;;
 	Linux)
-		DPDK_DIR=/usr/local/dpdk-2.1.0/x86_64-native-linuxapp-gcc
+		DPDK_DIR=/usr/local/share/dpdk/x86_64-native-linuxapp-gcc
 		MAKE=make
+		MAKEFLAGS=${MAKEFLAGS:--j$(nproc)}
 		MAKECONFIG="$MAKECONFIG CONFIG_COVERAGE=y"
+		MAKECONFIG="$MAKECONFIG CONFIG_UBSAN=y"
 		;;
 	*)
 		echo "Unknown OS in $0"
@@ -19,7 +26,9 @@ case `uname` in
 		;;
 esac
 
-MAKEFLAGS=${MAKEFLAGS:--j16}
+if [ -f /usr/include/infiniband/verbs.h ]; then
+	MAKECONFIG="$MAKECONFIG CONFIG_RDMA=y"
+fi
 
 if [ -z "$output_dir" ]; then
 	if [ -z "$rootdir" ] || [ ! -d "$rootdir/../output" ]; then
@@ -31,8 +40,7 @@ if [ -z "$output_dir" ]; then
 fi
 
 if hash valgrind &> /dev/null; then
-	# TODO: add --error-exitcode=2 when all Valgrind warnings are fixed
-	valgrind='valgrind --leak-check=full'
+	valgrind='valgrind --leak-check=full --error-exitcode=2'
 else
 	valgrind=''
 fi
@@ -60,11 +68,15 @@ function timing() {
 }
 
 function timing_enter() {
+	set +x
 	timing "enter" "$1"
+	set -x
 }
 
 function timing_exit() {
+	set +x
 	timing "exit" "$1"
+	set -x
 }
 
 function timing_finish() {
@@ -82,7 +94,7 @@ function timing_finish() {
 function process_core() {
 	ret=0
 	for core in $(find . -type f -name 'core*'); do
-		exe=$(eu-readelf -n "$core" | grep psargs | awk '{ print $2 }')
+		exe=$(eu-readelf -n "$core" | grep psargs | sed "s/.*psargs: \([^ \'\" ]*\).*/\1/")
 		echo "exe for $core is $exe"
 		if [[ ! -z "$exe" ]]; then
 			if hash gdb; then
@@ -97,3 +109,90 @@ function process_core() {
 	return $ret
 }
 
+function waitforlisten() {
+	# $1 = process pid
+	# $2 = TCP port number
+	if [ -z "$1" ] || [ -z "$2" ]; then
+		exit 1
+	fi
+
+	echo "Waiting for process to start up and listen on TCP port $2..."
+	# turn off trace for this loop
+	set +x
+	ret=1
+	while [ $ret -ne 0 ]; do
+		# if the process is no longer running, then exit the script
+		#  since it means the application crashed
+		if ! kill -s 0 $1; then
+			exit
+		fi
+		if netstat -an --tcp | grep -iw listen | grep -q $2; then
+			ret=0
+		fi
+	done
+	set -x
+}
+
+function killprocess() {
+	# $1 = process pid
+	if [ -z "$1" ]; then
+		exit 1
+	fi
+
+	echo "killing process with pid $1"
+	kill $1
+	wait $1
+}
+
+function iscsicleanup() {
+	echo "Cleaning up iSCSI connection"
+	iscsiadm -m node --logout || true
+	iscsiadm -m node -o delete || true
+}
+
+function stop_iscsi_service() {
+	if cat /etc/*-release | grep Ubuntu; then
+		service open-iscsi stop
+	else
+		service iscsid stop
+	fi
+}
+
+function start_iscsi_service() {
+	if cat /etc/*-release | grep Ubuntu; then
+		service open-iscsi start
+	else
+		service iscsid start
+	fi
+}
+
+function rbd_setup() {
+	export CEPH_DIR=/home/sys_sgsw/ceph/build
+
+	if [ -d $CEPH_DIR ]; then
+		export RBD_POOL=rbd
+		export RBD_NAME=foo
+		(cd $CEPH_DIR && ../src/vstart.sh -d -n -x -l)
+		/usr/local/bin/rbd create $RBD_NAME --size 1000
+	fi
+}
+
+function rbd_cleanup() {
+	if [ -d $CEPH_DIR ]; then
+		(cd $CEPH_DIR && ../src/stop.sh || true)
+	fi
+}
+
+function run_test() {
+	set +x
+	echo "************************************"
+	echo "START TEST $1"
+	echo "************************************"
+	set -x
+	time "$@"
+	set +x
+	echo "************************************"
+	echo "END TEST $1"
+	echo "************************************"
+	set -x
+}

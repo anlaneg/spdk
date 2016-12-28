@@ -1,7 +1,7 @@
 #
 #  BSD LICENSE
 #
-#  Copyright(c) 2010-2015 Intel Corporation. All rights reserved.
+#  Copyright (c) Intel Corporation.
 #  All rights reserved.
 #
 #  Redistribution and use in source and binary forms, with or without
@@ -31,27 +31,9 @@
 #  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-SPDK_ROOT_DIR := $(CURDIR)/../../..
+SPDK_ROOT_DIR := $(abspath $(CURDIR)/../../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
 APP = identify
 
-C_SRCS := identify.c
-
-CFLAGS += -I. $(DPDK_INC)
-
-SPDK_LIBS += $(SPDK_ROOT_DIR)/lib/nvme/libspdk_nvme.a \
-	     $(SPDK_ROOT_DIR)/lib/util/libspdk_util.a \
-	     $(SPDK_ROOT_DIR)/lib/memory/libspdk_memory.a
-
-LIBS += $(SPDK_LIBS) -lpciaccess -lpthread $(DPDK_LIB) -lrt
-
-all : $(APP)
-
-$(APP) : $(OBJS) $(SPDK_LIBS)
-	$(LINK_C)
-
-clean :
-	$(Q)rm -f $(OBJS) *.d $(APP)
-
-include $(SPDK_ROOT_DIR)/mk/spdk.deps.mk
+include $(SPDK_ROOT_DIR)/mk/nvme.libtest.mk

@@ -1,7 +1,7 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright(c) 2010-2015 Intel Corporation. All rights reserved.
+ *   Copyright (c) Intel Corporation.
  *   All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
@@ -31,10 +31,22 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+/** \file
+ * Memory barriers
+ */
+
 #ifndef SPDK_BARRIER_H
 #define SPDK_BARRIER_H
 
-#define wmb()	__asm volatile("sfence" ::: "memory")
-#define mb()	__asm volatile("mfence" ::: "memory")
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define spdk_wmb()	__asm volatile("sfence" ::: "memory")
+#define spdk_mb()	__asm volatile("mfence" ::: "memory")
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

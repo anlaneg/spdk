@@ -1,7 +1,7 @@
 #
 #  BSD LICENSE
 #
-#  Copyright(c) 2010-2015 Intel Corporation. All rights reserved.
+#  Copyright (c) Intel Corporation.
 #  All rights reserved.
 #
 #  Redistribution and use in source and binary forms, with or without
@@ -31,10 +31,10 @@
 #  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-SPDK_ROOT_DIR := $(CURDIR)/../../..
+SPDK_ROOT_DIR := $(abspath $(CURDIR)/../../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
-DIRS-y = unit aer
+DIRS-y = unit aer reset sgl e2edp overhead
 
 .PHONY: all clean $(DIRS-y)
 

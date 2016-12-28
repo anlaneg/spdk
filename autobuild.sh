@@ -11,11 +11,26 @@ umask 022
 
 cd $rootdir
 
+date -u
+git describe --tags
+
+if [ -d /usr/src/fio ]; then
+	MAKECONFIG="$MAKECONFIG CONFIG_FIO_PLUGIN=y FIO_SOURCE_DIR=/usr/src/fio"
+fi
+
+if [ -d /usr/include/rbd ] &&  [ -d /usr/include/rados ]; then
+	MAKECONFIG="$MAKECONFIG CONFIG_RBD=y"
+fi
+
 timing_enter autobuild
 
 timing_enter check_format
 ./scripts/check_format.sh
 timing_exit check_format
+
+timing_enter build_kmod
+./scripts/build_kmod.sh build
+timing_exit build_kmod
 
 scanbuild=''
 if hash scan-build; then
@@ -53,11 +68,8 @@ timing_enter doxygen
 if hash doxygen; then
 	(cd "$rootdir"/doc; $MAKE $MAKEFLAGS)
 	mkdir -p "$out"/doc
-	for d in "$rootdir"/doc/output.*; do
-		component=$(basename "$d" | sed -e 's/^output.//')
-		mv "$d"/html "$out"/doc/$component
-		rm -rf "$d"
-	done
+	mv "$rootdir"/doc/output/html "$out"/doc
+	rm -rf "$rootdir"/doc/output
 fi
 timing_exit doxygen
 

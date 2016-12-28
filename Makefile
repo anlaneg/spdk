@@ -1,7 +1,7 @@
 #
 #  BSD LICENSE
 #
-#  Copyright(c) 2010-2015 Intel Corporation. All rights reserved.
+#  Copyright (c) Intel Corporation.
 #  All rights reserved.
 #
 #  Redistribution and use in source and binary forms, with or without
@@ -31,17 +31,28 @@
 #  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
+S :=
+
 SPDK_ROOT_DIR := $(CURDIR)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
-DIRS-y += lib test examples
+DIRS-y += lib test examples app
 
-.PHONY: all clean $(DIRS-y)
+.PHONY: all clean $(DIRS-y) config.h
 
 all: $(DIRS-y)
 clean: $(DIRS-y)
+	$(Q)rm -f config.h
 
+app: lib
 test: lib
 examples: lib
+
+$(DIRS-y): config.h
+
+config.h: CONFIG scripts/genconfig.py
+	$(Q)python scripts/genconfig.py $(MAKEFLAGS) > $@.tmp; \
+	cmp -s $@.tmp $@ || mv $@.tmp $@ ; \
+	rm -f $@.tmp
 
 include $(SPDK_ROOT_DIR)/mk/spdk.subdirs.mk

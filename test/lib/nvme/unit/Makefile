@@ -1,7 +1,7 @@
 #
 #  BSD LICENSE
 #
-#  Copyright(c) 2010-2015 Intel Corporation. All rights reserved.
+#  Copyright (c) Intel Corporation.
 #  All rights reserved.
 #
 #  Redistribution and use in source and binary forms, with or without
@@ -31,10 +31,11 @@
 #  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-SPDK_ROOT_DIR := $(CURDIR)/../../../..
+SPDK_ROOT_DIR := $(abspath $(CURDIR)/../../../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
-DIRS-y = nvme_c nvme_ns_cmd_c nvme_qpair_c nvme_ctrlr_c nvme_ctrlr_cmd_c
+DIRS-y = nvme_c nvme_ns_cmd_c nvme_qpair_c nvme_ctrlr_c \
+         nvme_ctrlr_cmd_c nvme_quirks_c
 
 .PHONY: all clean $(DIRS-y)
 

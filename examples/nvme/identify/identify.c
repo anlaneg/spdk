@@ -1,7 +1,7 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright(c) 2010-2015 Intel Corporation. All rights reserved.
+ *   Copyright (c) Intel Corporation.
  *   All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
@@ -31,19 +31,22 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <inttypes.h>
 #include <stdbool.h>
-
-#include <pciaccess.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
 
 #include <rte_config.h>
-#include <rte_malloc.h>
-#include <rte_mempool.h>
 #include <rte_lcore.h>
 
+#include "spdk/log.h"
 #include "spdk/nvme.h"
-#include "spdk/pci.h"
-
-struct rte_mempool *request_mempool;
+#include "spdk/env.h"
+#include "spdk/nvme_intel.h"
+#include "spdk/nvmf_spec.h"
+#include "spdk/pci_ids.h"
 
 static int outstanding_commands;
 
@@ -54,14 +57,73 @@ struct feature {
 
 static struct feature features[256];
 
-static struct nvme_health_information_page *health_page;
+static struct spdk_nvme_error_information_entry error_page[256];
+
+static struct spdk_nvme_health_information_page health_page;
+
+static struct spdk_nvme_intel_smart_information_page intel_smart_page;
+
+static struct spdk_nvme_intel_temperature_page intel_temperature_page;
+
+static struct spdk_nvme_intel_marketing_description_page intel_md_page;
+
+static bool g_hex_dump = false;
+
+static struct spdk_nvme_transport_id trid;
 
 static void
-get_feature_completion(void *cb_arg, const struct nvme_completion *cpl)
+hex_dump(const void *data, size_t size)
+{
+	size_t offset = 0, i;
+	const uint8_t *bytes = data;
+
+	while (size) {
+		printf("%08zX:", offset);
+
+		for (i = 0; i < 16; i++) {
+			if (i == 8) {
+				printf("-");
+			} else {
+				printf(" ");
+			}
+
+			if (i < size) {
+				printf("%02X", bytes[offset + i]);
+			} else {
+				printf("  ");
+			}
+		}
+
+		printf("  ");
+
+		for (i = 0; i < 16; i++) {
+			if (i < size) {
+				if (bytes[offset + i] > 0x20 && bytes[offset + i] < 0x7F) {
+					printf("%c", bytes[offset + i]);
+				} else {
+					printf(".");
+				}
+			}
+		}
+
+		printf("\n");
+
+		offset += 16;
+		if (size > 16) {
+			size -= 16;
+		} else {
+			break;
+		}
+	}
+}
+
+static void
+get_feature_completion(void *cb_arg, const struct spdk_nvme_cpl *cpl)
 {
 	struct feature *feature = cb_arg;
 	int fid = feature - features;
-	if (nvme_completion_is_error(cpl)) {
+
+	if (spdk_nvme_cpl_is_error(cpl)) {
 		printf("get_feature(0x%02X) failed\n", fid);
 	} else {
 		feature->result = cpl->cdw0;
@@ -71,35 +133,35 @@ get_feature_completion(void *cb_arg, const struct nvme_completion *cpl)
 }
 
 static void
-get_log_page_completion(void *cb_arg, const struct nvme_completion *cpl)
+get_log_page_completion(void *cb_arg, const struct spdk_nvme_cpl *cpl)
 {
-	if (nvme_completion_is_error(cpl)) {
+	if (spdk_nvme_cpl_is_error(cpl)) {
 		printf("get log page failed\n");
 	}
 	outstanding_commands--;
 }
 
 static int
-get_feature(struct nvme_controller *ctrlr, uint8_t fid)
+get_feature(struct spdk_nvme_ctrlr *ctrlr, uint8_t fid)
 {
-	struct nvme_command cmd = {};
+	struct spdk_nvme_cmd cmd = {};
 
-	cmd.opc = NVME_OPC_GET_FEATURES;
+	cmd.opc = SPDK_NVME_OPC_GET_FEATURES;
 	cmd.cdw10 = fid;
 
-	return nvme_ctrlr_cmd_admin_raw(ctrlr, &cmd, NULL, 0, get_feature_completion, &features[fid]);
+	return spdk_nvme_ctrlr_cmd_admin_raw(ctrlr, &cmd, NULL, 0, get_feature_completion, &features[fid]);
 }
 
 static void
-get_features(struct nvme_controller *ctrlr)
+get_features(struct spdk_nvme_ctrlr *ctrlr)
 {
 	size_t i;
 
 	uint8_t features_to_get[] = {
-		NVME_FEAT_ARBITRATION,
-		NVME_FEAT_POWER_MANAGEMENT,
-		NVME_FEAT_TEMPERATURE_THRESHOLD,
-		NVME_FEAT_ERROR_RECOVERY,
+		SPDK_NVME_FEAT_ARBITRATION,
+		SPDK_NVME_FEAT_POWER_MANAGEMENT,
+		SPDK_NVME_FEAT_TEMPERATURE_THRESHOLD,
+		SPDK_NVME_FEAT_ERROR_RECOVERY,
 	};
 
 	/* Submit several GET FEATURES commands and wait for them to complete */
@@ -113,36 +175,90 @@ get_features(struct nvme_controller *ctrlr)
 	}
 
 	while (outstanding_commands) {
-		nvme_ctrlr_process_admin_completions(ctrlr);
+		spdk_nvme_ctrlr_process_admin_completions(ctrlr);
 	}
 }
 
 static int
-get_health_log_page(struct nvme_controller *ctrlr)
+get_error_log_page(struct spdk_nvme_ctrlr *ctrlr)
 {
-	struct nvme_command cmd = {};
+	const struct spdk_nvme_ctrlr_data *cdata;
 
-	if (health_page == NULL) {
-		health_page = rte_zmalloc("nvme health", sizeof(*health_page), 4096);
-	}
-	if (health_page == NULL) {
-		printf("Allocation error (health page)\n");
+	cdata = spdk_nvme_ctrlr_get_data(ctrlr);
+
+	if (spdk_nvme_ctrlr_cmd_get_log_page(ctrlr, SPDK_NVME_LOG_ERROR,
+					     SPDK_NVME_GLOBAL_NS_TAG, error_page,
+					     sizeof(*error_page) * (cdata->elpe + 1),
+					     0,
+					     get_log_page_completion, NULL)) {
+		printf("spdk_nvme_ctrlr_cmd_get_log_page() failed\n");
 		exit(1);
 	}
 
-	cmd.opc = NVME_OPC_GET_LOG_PAGE;
-	cmd.cdw10 = NVME_LOG_HEALTH_INFORMATION;
-	cmd.cdw10 |= ((sizeof(*health_page) / 4) - 1) << 16; // number of dwords
-	cmd.nsid = NVME_GLOBAL_NAMESPACE_TAG;
+	return 0;
+}
 
-	return nvme_ctrlr_cmd_admin_raw(ctrlr, &cmd, health_page, sizeof(*health_page),
-					get_log_page_completion, NULL);
+static int
+get_health_log_page(struct spdk_nvme_ctrlr *ctrlr)
+{
+	if (spdk_nvme_ctrlr_cmd_get_log_page(ctrlr, SPDK_NVME_LOG_HEALTH_INFORMATION,
+					     SPDK_NVME_GLOBAL_NS_TAG, &health_page, sizeof(health_page), 0, get_log_page_completion, NULL)) {
+		printf("spdk_nvme_ctrlr_cmd_get_log_page() failed\n");
+		exit(1);
+	}
+
+	return 0;
+}
+
+static int
+get_intel_smart_log_page(struct spdk_nvme_ctrlr *ctrlr)
+{
+	if (spdk_nvme_ctrlr_cmd_get_log_page(ctrlr, SPDK_NVME_INTEL_LOG_SMART, SPDK_NVME_GLOBAL_NS_TAG,
+					     &intel_smart_page, sizeof(intel_smart_page), 0, get_log_page_completion, NULL)) {
+		printf("spdk_nvme_ctrlr_cmd_get_log_page() failed\n");
+		exit(1);
+	}
+
+	return 0;
+}
+
+static int
+get_intel_temperature_log_page(struct spdk_nvme_ctrlr *ctrlr)
+{
+	if (spdk_nvme_ctrlr_cmd_get_log_page(ctrlr, SPDK_NVME_INTEL_LOG_TEMPERATURE,
+					     SPDK_NVME_GLOBAL_NS_TAG, &intel_temperature_page, sizeof(intel_temperature_page), 0,
+					     get_log_page_completion, NULL)) {
+		printf("spdk_nvme_ctrlr_cmd_get_log_page() failed\n");
+		exit(1);
+	}
+	return 0;
+}
+
+static int
+get_intel_md_log_page(struct spdk_nvme_ctrlr *ctrlr)
+{
+	if (spdk_nvme_ctrlr_cmd_get_log_page(ctrlr, SPDK_NVME_INTEL_MARKETING_DESCRIPTION,
+					     SPDK_NVME_GLOBAL_NS_TAG, &intel_md_page, sizeof(intel_md_page), 0,
+					     get_log_page_completion, NULL)) {
+		printf("spdk_nvme_ctrlr_cmd_get_log_page() failed\n");
+		exit(1);
+	}
+	return 0;
 }
 
 static void
-get_log_pages(struct nvme_controller *ctrlr)
+get_log_pages(struct spdk_nvme_ctrlr *ctrlr)
 {
+	const struct spdk_nvme_ctrlr_data *cdata;
 	outstanding_commands = 0;
+
+	cdata = spdk_nvme_ctrlr_get_data(ctrlr);
+
+	if (get_error_log_page(ctrlr) == 0) {
+		outstanding_commands++;
+	} else {
+		printf("Get Error Log Page failed\n");
+	}
 
 	if (get_health_log_page(ctrlr) == 0) {
 		outstanding_commands++;
@@ -150,17 +266,32 @@ get_log_pages(struct nvme_controller *ctrlr)
 		printf("Get Log Page (SMART/health) failed\n");
 	}
 
-	while (outstanding_commands) {
-		nvme_ctrlr_process_admin_completions(ctrlr);
-	}
-}
+	if (cdata->vid == SPDK_PCI_VID_INTEL) {
+		if (spdk_nvme_ctrlr_is_log_page_supported(ctrlr, SPDK_NVME_INTEL_LOG_SMART)) {
+			if (get_intel_smart_log_page(ctrlr) == 0) {
+				outstanding_commands++;
+			} else {
+				printf("Get Log Page (Intel SMART/health) failed\n");
+			}
+		}
+		if (spdk_nvme_ctrlr_is_log_page_supported(ctrlr, SPDK_NVME_INTEL_LOG_TEMPERATURE)) {
+			if (get_intel_temperature_log_page(ctrlr) == 0) {
+				outstanding_commands++;
+			} else {
+				printf("Get Log Page (Intel temperature) failed\n");
+			}
+		}
+		if (spdk_nvme_ctrlr_is_log_page_supported(ctrlr, SPDK_NVME_INTEL_MARKETING_DESCRIPTION)) {
+			if (get_intel_md_log_page(ctrlr) == 0) {
+				outstanding_commands++;
+			} else {
+				printf("Get Log Page (Intel Marketing Description) failed\n");
+			}
+		}
 
-static void
-cleanup(void)
-{
-	if (health_page) {
-		rte_free(health_page);
-		health_page = NULL;
+	}
+	while (outstanding_commands) {
+		spdk_nvme_ctrlr_process_admin_completions(ctrlr);
 	}
 }
 
@@ -187,21 +318,56 @@ print_uint128_dec(uint64_t *v)
 	}
 }
 
+/* The len should be <= 8.*/
 static void
-print_namespace(struct nvme_namespace *ns)
+print_uint_var_dec(uint8_t *array, unsigned int len)
 {
-	const struct nvme_namespace_data	*nsdata;
+	uint64_t result = 0;
+	int i = len;
+
+	while (i > 0) {
+		result += (uint64_t)array[i - 1] << (8 * (i - 1));
+		i--;
+	}
+	printf("%lu", result);
+}
+
+static void
+print_namespace(struct spdk_nvme_ns *ns)
+{
+	const struct spdk_nvme_ns_data		*nsdata;
 	uint32_t				i;
 	uint32_t				flags;
 
-	nsdata = nvme_ns_get_data(ns);
-	flags  = nvme_ns_get_flags(ns);
+	nsdata = spdk_nvme_ns_get_data(ns);
+	flags  = spdk_nvme_ns_get_flags(ns);
 
-	printf("Namespace ID:%d\n", nvme_ns_get_id(ns));
+	printf("Namespace ID:%d\n", spdk_nvme_ns_get_id(ns));
+
+	if (g_hex_dump) {
+		hex_dump(nsdata, sizeof(*nsdata));
+		printf("\n");
+	}
+
+	if (!spdk_nvme_ns_is_active(ns)) {
+		printf("Inactive namespace ID\n\n");
+		return;
+	}
+
 	printf("Deallocate:                  %s\n",
-	       (flags & NVME_NS_DEALLOCATE_SUPPORTED) ? "Supported" : "Not Supported");
+	       (flags & SPDK_NVME_NS_DEALLOCATE_SUPPORTED) ? "Supported" : "Not Supported");
 	printf("Flush:                       %s\n",
-	       (flags & NVME_NS_FLUSH_SUPPORTED) ? "Supported" : "Not Supported");
+	       (flags & SPDK_NVME_NS_FLUSH_SUPPORTED) ? "Supported" : "Not Supported");
+	printf("Reservation:                 %s\n",
+	       (flags & SPDK_NVME_NS_RESERVATION_SUPPORTED) ? "Supported" : "Not Supported");
+	if (flags & SPDK_NVME_NS_DPS_PI_SUPPORTED) {
+		printf("End-to-End Data Protection:  Supported\n");
+		printf("Protection Type:             Type%d\n", nsdata->dps.pit);
+		printf("Metadata Transfered as:      %s\n",
+		       nsdata->flbas.extended ? "Extended Data LBA" : "Separate Metadata Buffer");
+		printf("Metadata Location:           %s\n",
+		       nsdata->dps.md_start ? "First 8 Bytes" : "Last 8 Bytes");
+	}
 	printf("Size (in LBAs):              %lld (%lldM)\n",
 	       (long long)nsdata->nsze,
 	       (long long)nsdata->nsze / 1024 / 1024);
@@ -223,75 +389,147 @@ print_namespace(struct nvme_namespace *ns)
 }
 
 static void
-print_controller(struct nvme_controller *ctrlr, struct pci_device *pci_dev)
+print_controller(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_transport_id *trid)
 {
-	const struct nvme_controller_data	*cdata;
-	uint8_t					str[128];
+	const struct spdk_nvme_ctrlr_data	*cdata;
+	union spdk_nvme_cap_register		cap;
+	union spdk_nvme_vs_register		vs;
+	uint8_t					str[512];
 	uint32_t				i;
+	struct spdk_nvme_error_information_entry *error_entry;
+	struct spdk_pci_addr 			pci_addr;
+	struct spdk_pci_device			*pci_dev;
+	struct spdk_pci_id			pci_id;
+
+	cap = spdk_nvme_ctrlr_get_regs_cap(ctrlr);
+	vs = spdk_nvme_ctrlr_get_regs_vs(ctrlr);
 
 	get_features(ctrlr);
 	get_log_pages(ctrlr);
 
-	cdata = nvme_ctrlr_get_data(ctrlr);
+	cdata = spdk_nvme_ctrlr_get_data(ctrlr);
 
 	printf("=====================================================\n");
-	printf("NVMe Controller at PCI bus %d, device %d, function %d\n",
-	       pci_dev->bus, pci_dev->dev, pci_dev->func);
+	if (trid->trtype != SPDK_NVME_TRANSPORT_PCIE) {
+		printf("NVMe over Fabrics controller at %s:%s: %s\n",
+		       trid->traddr, trid->trsvcid, trid->subnqn);
+	} else {
+		if (spdk_pci_addr_parse(&pci_addr, trid->traddr) != 0) {
+			return;
+		}
+
+		pci_dev = spdk_pci_get_device(&pci_addr);
+		if (!pci_dev) {
+			return;
+		}
+
+		pci_id = spdk_pci_device_get_id(pci_dev);
+
+		printf("NVMe Controller at %04x:%02x:%02x.%x [%04x:%04x]\n",
+		       pci_addr.domain, pci_addr.bus,
+		       pci_addr.dev, pci_addr.func,
+		       pci_id.vendor_id, pci_id.device_id);
+	}
 	printf("=====================================================\n");
+
+	if (g_hex_dump) {
+		hex_dump(cdata, sizeof(*cdata));
+		printf("\n");
+	}
+
 	printf("Controller Capabilities/Features\n");
 	printf("================================\n");
-	printf("Vendor ID:                  %04x\n", cdata->vid);
-	printf("Subsystem Vendor ID:        %04x\n", cdata->ssvid);
+	printf("Vendor ID:                             %04x\n", cdata->vid);
+	printf("Subsystem Vendor ID:                   %04x\n", cdata->ssvid);
 	snprintf(str, sizeof(cdata->sn) + 1, "%s", cdata->sn);
-	printf("Serial Number:              %s\n", str);
+	printf("Serial Number:                         %s\n", str);
 	snprintf(str, sizeof(cdata->mn) + 1, "%s", cdata->mn);
-	printf("Model Number:               %s\n", str);
+	printf("Model Number:                          %s\n", str);
 	snprintf(str, sizeof(cdata->fr) + 1, "%s", cdata->fr);
-	printf("Firmware Version:           %s\n", str);
-	printf("Recommended Arb Burst:      %d\n", cdata->rab);
-	printf("IEEE OUI Identifier:        %02x %02x %02x\n",
+	printf("Firmware Version:                      %s\n", str);
+	printf("Recommended Arb Burst:                 %d\n", cdata->rab);
+	printf("IEEE OUI Identifier:                   %02x %02x %02x\n",
 	       cdata->ieee[0], cdata->ieee[1], cdata->ieee[2]);
-	printf("Multi-Interface Cap:        %02x\n", cdata->mic);
-	/* TODO: Use CAP.MPSMIN to determine true memory page size. */
-	printf("Max Data Transfer Size:     ");
+	printf("Multi-path I/O\n");
+	printf("  May have multiple subsystem ports:   %s\n", cdata->cmic.multi_port ? "Yes" : "No");
+	printf("  May be connected to multiple hosts:  %s\n", cdata->cmic.multi_host ? "Yes" : "No");
+	printf("  Associated with SR-IOV VF:           %s\n", cdata->cmic.sr_iov ? "Yes" : "No");
+	printf("Max Data Transfer Size:                ");
 	if (cdata->mdts == 0)
 		printf("Unlimited\n");
 	else
-		printf("%d\n", 4096 * (1 << cdata->mdts));
-	if (features[NVME_FEAT_ERROR_RECOVERY].valid) {
-		unsigned tler = features[NVME_FEAT_ERROR_RECOVERY].result & 0xFFFF;
-		printf("Error Recovery Timeout:     ");
+		printf("%" PRIu64 "\n", (uint64_t)1 << (12 + cap.bits.mpsmin + cdata->mdts));
+	if (features[SPDK_NVME_FEAT_ERROR_RECOVERY].valid) {
+		unsigned tler = features[SPDK_NVME_FEAT_ERROR_RECOVERY].result & 0xFFFF;
+		printf("Error Recovery Timeout:                ");
 		if (tler == 0) {
 			printf("Unlimited\n");
 		} else {
 			printf("%u milliseconds\n", tler * 100);
 		}
 	}
+	printf("NVMe Specification Version (VS):       %u.%u", vs.bits.mjr, vs.bits.mnr);
+	if (vs.bits.ter) {
+		printf(".%u", vs.bits.ter);
+	}
+	printf("\n");
+	if (cdata->ver.raw != 0) {
+		printf("NVMe Specification Version (Identify): %u.%u", cdata->ver.bits.mjr, cdata->ver.bits.mnr);
+		if (cdata->ver.bits.ter) {
+			printf(".%u", cdata->ver.bits.ter);
+		}
+		printf("\n");
+	}
+
+	printf("Maximum Queue Entries:                 %u\n", cap.bits.mqes + 1);
+	printf("Contiguous Queues Required:            %s\n", cap.bits.cqr ? "Yes" : "No");
+	printf("Arbitration Mechanisms Supported\n");
+	printf("  Weighted Round Robin:                %s\n",
+	       cap.bits.ams & SPDK_NVME_CAP_AMS_WRR ? "Supported" : "Not Supported");
+	printf("  Vendor Specific:                     %s\n",
+	       cap.bits.ams & SPDK_NVME_CAP_AMS_VS ? "Supported" : "Not Supported");
+	printf("Reset Timeout:                         %" PRIu64 " ms\n", (uint64_t)500 * cap.bits.to);
+	printf("Doorbell Stride:                       %" PRIu64 " bytes\n",
+	       (uint64_t)1 << (2 + cap.bits.dstrd));
+	printf("NVM Subsystem Reset:                   %s\n",
+	       cap.bits.nssrs ? "Supported" : "Not Supported");
+	printf("Command Sets Supported\n");
+	printf("  NVM Command Set:                     %s\n",
+	       cap.bits.css_nvm ? "Supported" : "Not Supported");
+	printf("Memory Page Size Minimum:              %" PRIu64 " bytes\n",
+	       (uint64_t)1 << (12 + cap.bits.mpsmin));
+	printf("Memory Page Size Maximum:              %" PRIu64 " bytes\n",
+	       (uint64_t)1 << (12 + cap.bits.mpsmax));
+	printf("Optional Asynchronous Events Supported\n");
+	printf("  Namespace Attribute Notices:         %s\n",
+	       cdata->oaes.ns_attribute_notices ? "Supported" : "Not Supported");
+	printf("  Firmware Activation Notices:         %s\n",
+	       cdata->oaes.fw_activation_notices ? "Supported" : "Not Supported");
 	printf("\n");
 
 	printf("Admin Command Set Attributes\n");
 	printf("============================\n");
-	printf("Security Send/Receive:       %s\n",
+	printf("Security Send/Receive:                 %s\n",
 	       cdata->oacs.security ? "Supported" : "Not Supported");
-	printf("Format NVM:                  %s\n",
+	printf("Format NVM:                            %s\n",
 	       cdata->oacs.format ? "Supported" : "Not Supported");
-	printf("Firmware Activate/Download:  %s\n",
+	printf("Firmware Activate/Download:            %s\n",
 	       cdata->oacs.firmware ? "Supported" : "Not Supported");
-	printf("Abort Command Limit:         %d\n", cdata->acl + 1);
-	printf("Async Event Request Limit:   %d\n", cdata->aerl + 1);
-	printf("Number of Firmware Slots:    ");
+	printf("Abort Command Limit:                   %d\n", cdata->acl + 1);
+	printf("Async Event Request Limit:             %d\n", cdata->aerl + 1);
+	printf("Number of Firmware Slots:              ");
 	if (cdata->oacs.firmware != 0)
 		printf("%d\n", cdata->frmw.num_slots);
 	else
 		printf("N/A\n");
-	printf("Firmware Slot 1 Read-Only:   ");
+	printf("Firmware Slot 1 Read-Only:             ");
 	if (cdata->oacs.firmware != 0)
 		printf("%s\n", cdata->frmw.slot1_ro ? "Yes" : "No");
 	else
 		printf("N/A\n");
-	printf("Per-Namespace SMART Log:     %s\n",
+	printf("Per-Namespace SMART Log:               %s\n",
 	       cdata->lpa.ns_smart ? "Yes" : "No");
-	printf("Error Log Page Entries:      %d\n", cdata->elpe + 1);
+	printf("Error Log Page Entries Supported:      %d\n", cdata->elpe + 1);
 	printf("\n");
 
 	printf("NVM Command Set Attributes\n");
@@ -309,15 +547,63 @@ print_controller(struct nvme_controller *ctrlr, struct pci_device *pci_dev)
 	       cdata->oncs.write_unc ? "Supported" : "Not Supported");
 	printf("Dataset Management Command:  %s\n",
 	       cdata->oncs.dsm ? "Supported" : "Not Supported");
+	printf("Write Zeroes Command:        %s\n",
+	       cdata->oncs.write_zeroes ? "Supported" : "Not Supported");
+	printf("Set Features Save Field:     %s\n",
+	       cdata->oncs.set_features_save ? "Supported" : "Not Supported");
+	printf("Reservations:                %s\n",
+	       cdata->oncs.reservations ? "Supported" : "Not Supported");
 	printf("Volatile Write Cache:        %s\n",
 	       cdata->vwc.present ? "Present" : "Not Present");
+	printf("Scatter-Gather List\n");
+	printf("  SGL Command Set:           %s\n",
+	       cdata->sgls.supported ? "Supported" : "Not Supported");
+	printf("  SGL Keyed:                 %s\n",
+	       cdata->sgls.keyed_sgl ? "Supported" : "Not Supported");
+	printf("  SGL Bit Bucket Descriptor: %s\n",
+	       cdata->sgls.bit_bucket_descriptor ? "Supported" : "Not Supported");
+	printf("  SGL Metadata Pointer:      %s\n",
+	       cdata->sgls.metadata_pointer ? "Supported" : "Not Supported");
+	printf("  Oversized SGL:             %s\n",
+	       cdata->sgls.oversized_sgl ? "Supported" : "Not Supported");
+	printf("  SGL Metadata Address:      %s\n",
+	       cdata->sgls.metadata_address ? "Supported" : "Not Supported");
+	printf("  SGL Offset:                %s\n",
+	       cdata->sgls.sgl_offset ? "Supported" : "Not Supported");
 	printf("\n");
 
-	if (features[NVME_FEAT_ARBITRATION].valid) {
-		uint32_t arb = features[NVME_FEAT_ARBITRATION].result;
+	printf("Error Log\n");
+	printf("=========\n");
+	for (i = 0; i <= cdata->elpe; i++) {
+		error_entry = &error_page[i];
+		if (error_entry->error_count == 0) {
+			continue;
+		}
+		if (i != 0) {
+			printf("-----------\n");
+		}
+
+		printf("Entry: %u\n", i);
+		printf("Error Count:            0x%"PRIx64"\n", error_entry->error_count);
+		printf("Submission Queue Id:    0x%x\n", error_entry->sqid);
+		printf("Command Id:             0x%x\n", error_entry->cid);
+		printf("Phase Bit:              %x\n", error_entry->status.p);
+		printf("Status Code:            0x%x\n", error_entry->status.sc);
+		printf("Status Code Type:       0x%x\n", error_entry->status.sct);
+		printf("Do Not Retry:           %x\n", error_entry->status.dnr);
+		printf("Error Location:         0x%x\n", error_entry->error_location);
+		printf("LBA:                    0x%"PRIx64"\n", error_entry->lba);
+		printf("Namespace:              0x%x\n", error_entry->nsid);
+		printf("Vendor Log Page:        0x%x\n", error_entry->vendor_specific);
+
+	}
+	printf("\n");
+
+	if (features[SPDK_NVME_FEAT_ARBITRATION].valid) {
+		uint32_t arb = features[SPDK_NVME_FEAT_ARBITRATION].result;
 		unsigned ab, lpw, mpw, hpw;
 
-		ab = arb & 0x3;
+		ab = arb & 0x7;
 		lpw = ((arb >> 8) & 0xFF) + 1;
 		mpw = ((arb >> 16) & 0xFF) + 1;
 		hpw = ((arb >> 24) & 0xFF) + 1;
@@ -325,7 +611,7 @@ print_controller(struct nvme_controller *ctrlr, struct pci_device *pci_dev)
 		printf("Arbitration\n");
 		printf("===========\n");
 		printf("Arbitration Burst:           ");
-		if (ab == 7) {
+		if (ab == 0x7) {
 			printf("no limit\n");
 		} else {
 			printf("%u\n", 1u << ab);
@@ -336,14 +622,14 @@ print_controller(struct nvme_controller *ctrlr, struct pci_device *pci_dev)
 		printf("\n");
 	}
 
-	if (features[NVME_FEAT_POWER_MANAGEMENT].valid) {
-		unsigned ps = features[NVME_FEAT_POWER_MANAGEMENT].result & 0x1F;
+	if (features[SPDK_NVME_FEAT_POWER_MANAGEMENT].valid) {
+		unsigned ps = features[SPDK_NVME_FEAT_POWER_MANAGEMENT].result & 0x1F;
 		printf("Power Management\n");
 		printf("================\n");
 		printf("Number of Power States:      %u\n", cdata->npss + 1);
 		printf("Current Power State:         Power State #%u\n", ps);
 		for (i = 0; i <= cdata->npss; i++) {
-			const struct nvme_power_state *psd = &cdata->psd[i];
+			const struct spdk_nvme_power_state *psd = &cdata->psd[i];
 			printf("Power State #%u:  ", i);
 			if (psd->mps) {
 				/* MP scale is 0.0001 W */
@@ -361,78 +647,338 @@ print_controller(struct nvme_controller *ctrlr, struct pci_device *pci_dev)
 		printf("\n");
 	}
 
-	if (features[NVME_FEAT_TEMPERATURE_THRESHOLD].valid && health_page) {
+	if (features[SPDK_NVME_FEAT_TEMPERATURE_THRESHOLD].valid) {
 		printf("Health Information\n");
 		printf("==================\n");
+
+		if (g_hex_dump) {
+			hex_dump(&health_page, sizeof(health_page));
+			printf("\n");
+		}
+
 		printf("Critical Warnings:\n");
 		printf("  Available Spare Space:     %s\n",
-		       health_page->critical_warning.bits.available_spare ? "WARNING" : "OK");
+		       health_page.critical_warning.bits.available_spare ? "WARNING" : "OK");
 		printf("  Temperature:               %s\n",
-		       health_page->critical_warning.bits.temperature ? "WARNING" : "OK");
+		       health_page.critical_warning.bits.temperature ? "WARNING" : "OK");
 		printf("  Device Reliability:        %s\n",
-		       health_page->critical_warning.bits.device_reliability ? "WARNING" : "OK");
+		       health_page.critical_warning.bits.device_reliability ? "WARNING" : "OK");
 		printf("  Read Only:                 %s\n",
-		       health_page->critical_warning.bits.read_only ? "Yes" : "No");
+		       health_page.critical_warning.bits.read_only ? "Yes" : "No");
 		printf("  Volatile Memory Backup:    %s\n",
-		       health_page->critical_warning.bits.volatile_memory_backup ? "WARNING" : "OK");
+		       health_page.critical_warning.bits.volatile_memory_backup ? "WARNING" : "OK");
 		printf("Current Temperature:         %u Kelvin (%u Celsius)\n",
-		       health_page->temperature,
-		       health_page->temperature - 273);
+		       health_page.temperature,
+		       health_page.temperature - 273);
 		printf("Temperature Threshold:       %u Kelvin (%u Celsius)\n",
-		       features[NVME_FEAT_TEMPERATURE_THRESHOLD].result,
-		       features[NVME_FEAT_TEMPERATURE_THRESHOLD].result - 273);
-		printf("Available Spare:             %u%%\n", health_page->available_spare);
-		printf("Life Percentage Used:        %u%%\n", health_page->percentage_used);
+		       features[SPDK_NVME_FEAT_TEMPERATURE_THRESHOLD].result,
+		       features[SPDK_NVME_FEAT_TEMPERATURE_THRESHOLD].result - 273);
+		printf("Available Spare:             %u%%\n", health_page.available_spare);
+		printf("Life Percentage Used:        %u%%\n", health_page.percentage_used);
 		printf("Data Units Read:             ");
-		print_uint128_dec(health_page->data_units_read);
+		print_uint128_dec(health_page.data_units_read);
 		printf("\n");
 		printf("Data Units Written:          ");
-		print_uint128_dec(health_page->data_units_written);
+		print_uint128_dec(health_page.data_units_written);
 		printf("\n");
 		printf("Host Read Commands:          ");
-		print_uint128_dec(health_page->host_read_commands);
+		print_uint128_dec(health_page.host_read_commands);
 		printf("\n");
 		printf("Host Write Commands:         ");
-		print_uint128_dec(health_page->host_write_commands);
+		print_uint128_dec(health_page.host_write_commands);
 		printf("\n");
 		printf("Controller Busy Time:        ");
-		print_uint128_dec(health_page->controller_busy_time);
+		print_uint128_dec(health_page.controller_busy_time);
 		printf(" minutes\n");
 		printf("Power Cycles:                ");
-		print_uint128_dec(health_page->power_cycles);
+		print_uint128_dec(health_page.power_cycles);
 		printf("\n");
 		printf("Power On Hours:              ");
-		print_uint128_dec(health_page->power_on_hours);
+		print_uint128_dec(health_page.power_on_hours);
 		printf(" hours\n");
 		printf("Unsafe Shutdowns:            ");
-		print_uint128_dec(health_page->unsafe_shutdowns);
+		print_uint128_dec(health_page.unsafe_shutdowns);
 		printf("\n");
 		printf("Unrecoverable Media Errors:  ");
-		print_uint128_dec(health_page->media_errors);
+		print_uint128_dec(health_page.media_errors);
 		printf("\n");
 		printf("Lifetime Error Log Entries:  ");
-		print_uint128_dec(health_page->num_error_info_log_entries);
+		print_uint128_dec(health_page.num_error_info_log_entries);
 		printf("\n");
 		printf("\n");
 	}
 
-	for (i = 1; i <= nvme_ctrlr_get_num_ns(ctrlr); i++) {
-		print_namespace(nvme_ctrlr_get_ns(ctrlr, i));
+	if (spdk_nvme_ctrlr_is_log_page_supported(ctrlr, SPDK_NVME_INTEL_LOG_SMART)) {
+		size_t i = 0;
+
+		printf("Intel Health Information\n");
+		printf("==================\n");
+		for (i = 0;
+		     i < sizeof(intel_smart_page.attributes) / sizeof(intel_smart_page.attributes[0]); i++) {
+			if (intel_smart_page.attributes[i].code == SPDK_NVME_INTEL_SMART_PROGRAM_FAIL_COUNT) {
+				printf("Program Fail Count:\n");
+				printf("  Normalized Value : %d\n",
+				       intel_smart_page.attributes[i].normalized_value);
+				printf("  Current Raw Value: ");
+				print_uint_var_dec(intel_smart_page.attributes[i].raw_value, 6);
+				printf("\n");
+			}
+			if (intel_smart_page.attributes[i].code == SPDK_NVME_INTEL_SMART_ERASE_FAIL_COUNT) {
+				printf("Erase Fail Count:\n");
+				printf("  Normalized Value : %d\n",
+				       intel_smart_page.attributes[i].normalized_value);
+				printf("  Current Raw Value: ");
+				print_uint_var_dec(intel_smart_page.attributes[i].raw_value, 6);
+				printf("\n");
+			}
+			if (intel_smart_page.attributes[i].code == SPDK_NVME_INTEL_SMART_WEAR_LEVELING_COUNT) {
+				printf("Wear Leveling Count:\n");
+				printf("  Normalized Value : %d\n",
+				       intel_smart_page.attributes[i].normalized_value);
+				printf("  Current Raw Value: \n");
+				printf("  Min: ");
+				print_uint_var_dec(&intel_smart_page.attributes[i].raw_value[0], 2);
+				printf("\n");
+				printf("  Max: ");
+				print_uint_var_dec(&intel_smart_page.attributes[i].raw_value[2], 2);
+				printf("\n");
+				printf("  Avg: ");
+				print_uint_var_dec(&intel_smart_page.attributes[i].raw_value[4], 2);
+				printf("\n");
+			}
+			if (intel_smart_page.attributes[i].code == SPDK_NVME_INTEL_SMART_E2E_ERROR_COUNT) {
+				printf("End to End Error Detection Count:\n");
+				printf("  Normalized Value : %d\n",
+				       intel_smart_page.attributes[i].normalized_value);
+				printf("  Current Raw Value: ");
+				print_uint_var_dec(intel_smart_page.attributes[i].raw_value, 6);
+				printf("\n");
+			}
+			if (intel_smart_page.attributes[i].code == SPDK_NVME_INTEL_SMART_CRC_ERROR_COUNT) {
+				printf("CRC Error Count:\n");
+				printf("  Normalized Value : %d\n",
+				       intel_smart_page.attributes[i].normalized_value);
+				printf("  Current Raw Value: ");
+				print_uint_var_dec(intel_smart_page.attributes[i].raw_value, 6);
+				printf("\n");
+			}
+			if (intel_smart_page.attributes[i].code == SPDK_NVME_INTEL_SMART_MEDIA_WEAR) {
+				printf("Timed Workload, Media Wear:\n");
+				printf("  Normalized Value : %d\n",
+				       intel_smart_page.attributes[i].normalized_value);
+				printf("  Current Raw Value: ");
+				print_uint_var_dec(intel_smart_page.attributes[i].raw_value, 6);
+				printf("\n");
+			}
+			if (intel_smart_page.attributes[i].code == SPDK_NVME_INTEL_SMART_HOST_READ_PERCENTAGE) {
+				printf("Timed Workload, Host Read/Write Ratio:\n");
+				printf("  Normalized Value : %d\n",
+				       intel_smart_page.attributes[i].normalized_value);
+				printf("  Current Raw Value: ");
+				print_uint_var_dec(intel_smart_page.attributes[i].raw_value, 6);
+				printf("%%");
+				printf("\n");
+			}
+			if (intel_smart_page.attributes[i].code == SPDK_NVME_INTEL_SMART_TIMER) {
+				printf("Timed Workload, Timer:\n");
+				printf("  Normalized Value : %d\n",
+				       intel_smart_page.attributes[i].normalized_value);
+				printf("  Current Raw Value: ");
+				print_uint_var_dec(intel_smart_page.attributes[i].raw_value, 6);
+				printf("\n");
+			}
+			if (intel_smart_page.attributes[i].code == SPDK_NVME_INTEL_SMART_THERMAL_THROTTLE_STATUS) {
+				printf("Thermal Throttle Status:\n");
+				printf("  Normalized Value : %d\n",
+				       intel_smart_page.attributes[i].normalized_value);
+				printf("  Current Raw Value: \n");
+				printf("  Percentage: %d%%\n", intel_smart_page.attributes[i].raw_value[0]);
+				printf("  Throttling Event Count: ");
+				print_uint_var_dec(&intel_smart_page.attributes[i].raw_value[1], 4);
+				printf("\n");
+			}
+			if (intel_smart_page.attributes[i].code == SPDK_NVME_INTEL_SMART_RETRY_BUFFER_OVERFLOW_COUNTER) {
+				printf("Retry Buffer Overflow Counter:\n");
+				printf("  Normalized Value : %d\n",
+				       intel_smart_page.attributes[i].normalized_value);
+				printf("  Current Raw Value: ");
+				print_uint_var_dec(intel_smart_page.attributes[i].raw_value, 6);
+				printf("\n");
+			}
+			if (intel_smart_page.attributes[i].code == SPDK_NVME_INTEL_SMART_PLL_LOCK_LOSS_COUNT) {
+				printf("PLL Lock Loss Count:\n");
+				printf("  Normalized Value : %d\n",
+				       intel_smart_page.attributes[i].normalized_value);
+				printf("  Current Raw Value: ");
+				print_uint_var_dec(intel_smart_page.attributes[i].raw_value, 6);
+				printf("\n");
+			}
+			if (intel_smart_page.attributes[i].code == SPDK_NVME_INTEL_SMART_NAND_BYTES_WRITTEN) {
+				printf("NAND Bytes Written:\n");
+				printf("  Normalized Value : %d\n",
+				       intel_smart_page.attributes[i].normalized_value);
+				printf("  Current Raw Value: ");
+				print_uint_var_dec(intel_smart_page.attributes[i].raw_value, 6);
+				printf("\n");
+			}
+			if (intel_smart_page.attributes[i].code == SPDK_NVME_INTEL_SMART_HOST_BYTES_WRITTEN) {
+				printf("Host Bytes Written:\n");
+				printf("  Normalized Value : %d\n",
+				       intel_smart_page.attributes[i].normalized_value);
+				printf("  Current Raw Value: ");
+				print_uint_var_dec(intel_smart_page.attributes[i].raw_value, 6);
+				printf("\n");
+			}
+		}
+		printf("\n");
 	}
+
+	if (spdk_nvme_ctrlr_is_log_page_supported(ctrlr, SPDK_NVME_INTEL_LOG_TEMPERATURE)) {
+		printf("Intel Temperature Information\n");
+		printf("==================\n");
+		printf("Current Temperature: %lu\n", intel_temperature_page.current_temperature);
+		printf("Overtemp shutdown Flag for last critical component temperature: %lu\n",
+		       intel_temperature_page.shutdown_flag_last);
+		printf("Overtemp shutdown Flag for life critical component temperature: %lu\n",
+		       intel_temperature_page.shutdown_flag_life);
+		printf("Highest temperature: %lu\n", intel_temperature_page.highest_temperature);
+		printf("Lowest temperature: %lu\n", intel_temperature_page.lowest_temperature);
+		printf("Specified Maximum Operating Temperature: %lu\n",
+		       intel_temperature_page.specified_max_op_temperature);
+		printf("Specified Minimum Operating Temperature: %lu\n",
+		       intel_temperature_page.specified_min_op_temperature);
+		printf("Estimated offset: %ld\n", intel_temperature_page.estimated_offset);
+		printf("\n");
+		printf("\n");
+
+	}
+
+	if (spdk_nvme_ctrlr_is_log_page_supported(ctrlr, SPDK_NVME_INTEL_MARKETING_DESCRIPTION)) {
+		printf("Intel Marketing Information\n");
+		printf("==================\n");
+		snprintf(str, sizeof(intel_md_page.marketing_product), "%s", intel_md_page.marketing_product);
+		printf("Marketing Product Information:		%s\n", str);
+		printf("\n");
+		printf("\n");
+	}
+
+	for (i = 1; i <= spdk_nvme_ctrlr_get_num_ns(ctrlr); i++) {
+		print_namespace(spdk_nvme_ctrlr_get_ns(ctrlr, i));
+	}
+}
+
+static void
+usage(const char *program_name)
+{
+	printf("%s [options]", program_name);
+	printf("\n");
+	printf("options:\n");
+	printf(" -a addr    address of NVMe over Fabrics discovery service\n");
+	printf(" -s service service ID for NVMe over Fabrics discovery service\n");
+	printf(" -n nqn     NQN of NVMe over Fabrics discovery service\n");
+
+	spdk_tracelog_usage(stdout, "-t");
+
+	printf(" -x         print hex dump of raw data\n");
+	printf(" -v         verbose (enable warnings)\n");
+	printf(" -H         show this usage\n");
+}
+
+static int
+parse_args(int argc, char **argv)
+{
+	int op, rc;
+
+	trid.trtype = SPDK_NVME_TRANSPORT_PCIE;
+	snprintf(trid.subnqn, sizeof(trid.subnqn), "%s", SPDK_NVMF_DISCOVERY_NQN);
+
+	while ((op = getopt(argc, argv, "a:n:s:t:xH")) != -1) {
+		switch (op) {
+		case 'x':
+			g_hex_dump = true;
+			break;
+		case 't':
+			rc = spdk_log_set_trace_flag(optarg);
+			if (rc < 0) {
+				fprintf(stderr, "unknown flag\n");
+				usage(argv[0]);
+				exit(EXIT_FAILURE);
+			}
+#ifndef DEBUG
+			fprintf(stderr, "%s must be rebuilt with CONFIG_DEBUG=y for -t flag.\n",
+				argv[0]);
+			usage(argv[0]);
+			return 0;
+#endif
+			break;
+		case 'a':
+			trid.trtype = SPDK_NVME_TRANSPORT_RDMA;
+			trid.adrfam = SPDK_NVMF_ADRFAM_IPV4;
+			snprintf(trid.traddr, sizeof(trid.traddr), "%s", optarg);
+			break;
+		case 's':
+			snprintf(trid.trsvcid, sizeof(trid.trsvcid), "%s", optarg);
+			break;
+		case 'n':
+			snprintf(trid.subnqn, sizeof(trid.subnqn), "%s", optarg);
+			break;
+		case 'H':
+		default:
+			usage(argv[0]);
+			return 1;
+		}
+	}
+
+	if (!trid.traddr || !trid.trsvcid || !trid.subnqn) {
+		return 0;
+	}
+
+	if ((strlen(trid.traddr) > 255)) {
+		printf("The string len of traddr should <= 255\n");
+		return 0;
+	}
+
+	if (strlen(trid.subnqn) >= SPDK_NVMF_NQN_MAX_LEN) {
+		printf("NQN must be less than %d bytes long\n", SPDK_NVMF_NQN_MAX_LEN);
+		return 0;
+	}
+
+	optind = 1;
+
+	return 0;
+}
+
+static bool
+probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
+	 struct spdk_nvme_ctrlr_opts *opts)
+{
+	return true;
+}
+
+static void
+attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
+	  struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_ctrlr_opts *opts)
+{
+	print_controller(ctrlr, trid);
+	spdk_nvme_detach(ctrlr);
 }
 
 static const char *ealargs[] = {
 	"identify",
 	"-c 0x1",
 	"-n 4",
+	"-m 512",
+	"--proc-type=auto",
 };
 
 int main(int argc, char **argv)
 {
-	struct pci_device_iterator	*pci_dev_iter;
-	struct pci_device		*pci_dev;
-	struct pci_id_match		match;
 	int				rc;
+
+	rc = parse_args(argc, argv);
+	if (rc != 0) {
+		return rc;
+	}
 
 	rc = rte_eal_init(sizeof(ealargs) / sizeof(ealargs[0]),
 			  (char **)(void *)(uintptr_t)ealargs);
@@ -442,55 +988,17 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 
-	request_mempool = rte_mempool_create("nvme_request", 8192,
-					     nvme_request_size(), 128, 0,
-					     NULL, NULL, NULL, NULL,
-					     SOCKET_ID_ANY, 0);
-
-	if (request_mempool == NULL) {
-		fprintf(stderr, "could not initialize request mempool\n");
-		exit(1);
-	}
-
-	pci_system_init();
-
-	match.vendor_id =	PCI_MATCH_ANY;
-	match.subvendor_id =	PCI_MATCH_ANY;
-	match.subdevice_id =	PCI_MATCH_ANY;
-	match.device_id =	PCI_MATCH_ANY;
-	match.device_class =	NVME_CLASS_CODE;
-	match.device_class_mask = 0xFFFFFF;
-
-	pci_dev_iter = pci_id_match_iterator_create(&match);
-
 	rc = 0;
-	while ((pci_dev = pci_device_next(pci_dev_iter))) {
-		struct nvme_controller *ctrlr;
-
-		if (pci_device_has_non_null_driver(pci_dev)) {
-			fprintf(stderr, "non-null kernel driver attached to nvme\n");
-			fprintf(stderr, " controller at pci bdf %d:%d:%d\n",
-				pci_dev->bus, pci_dev->dev, pci_dev->func);
-			fprintf(stderr, " skipping...\n");
-			continue;
+	if (trid.trtype == SPDK_NVME_TRANSPORT_RDMA) {
+		if (spdk_nvme_probe(&trid, NULL, probe_cb, attach_cb, NULL) != 0) {
+			fprintf(stderr, "spdk_nvme_probe() failed\n");
 		}
-
-		pci_device_probe(pci_dev);
-
-		ctrlr = nvme_attach(pci_dev);
-		if (ctrlr == NULL) {
-			fprintf(stderr, "failed to attach to NVMe controller at PCI BDF %d:%d:%d\n",
-				pci_dev->bus, pci_dev->dev, pci_dev->func);
-			rc = 1;
-			continue;
-		}
-
-		print_controller(ctrlr, pci_dev);
-		nvme_detach(ctrlr);
 	}
 
-	cleanup();
+	if (spdk_nvme_probe(NULL, NULL, probe_cb, attach_cb, NULL) != 0) {
+		fprintf(stderr, "spdk_nvme_probe() failed\n");
+		rc = 1;
+	}
 
-	pci_iterator_destroy(pci_dev_iter);
 	return rc;
 }

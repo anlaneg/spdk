@@ -1,7 +1,7 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright(c) 2010-2015 Intel Corporation. All rights reserved.
+ *   Copyright (c) Intel Corporation.
  *   All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
@@ -34,6 +34,10 @@
 #ifndef SPDK_QUEUE_H
 #define SPDK_QUEUE_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/cdefs.h>
 #include <sys/queue.h>
 
@@ -44,6 +48,10 @@
  */
 #ifndef __FreeBSD__
 #include <spdk/queue_extras.h>
+#endif
+
+#ifdef __cplusplus
+}
 #endif
 
 #endif
