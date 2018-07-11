@@ -33,14 +33,16 @@
 
 SPDK_ROOT_DIR := $(abspath $(CURDIR)/../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
+include $(SPDK_ROOT_DIR)/mk/spdk.app.mk
 
-CXXFLAGS += $(DPDK_INC)
+CXXFLAGS += $(ENV_CXXFLAGS)
 CXXFLAGS += -I$(SPDK_ROOT_DIR)/lib
 CXX_SRCS = iscsi_top.cpp
 
 APP = iscsi_top
 
 all: $(APP)
+	@:
 
 $(APP) : $(OBJS)
 	$(LINK_CXX)

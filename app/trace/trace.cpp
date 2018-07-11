@@ -31,20 +31,7 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <sys/types.h>
-#include <sys/uio.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <inttypes.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <string.h>
-#include <errno.h>
-#include <unistd.h>
-#include <signal.h>
-#include <fcntl.h>
+#include "spdk/stdinc.h"
 
 #include <map>
 
@@ -94,7 +81,6 @@ struct object_stats g_stats[SPDK_TRACE_MAX_OBJECT];
 
 static char *exe_name;
 static int verbose = 1;
-static int g_instance_id = 0;
 static int g_fudge_factor = 20;
 
 static uint64_t tsc_rate;
@@ -137,7 +123,7 @@ print_size(uint32_t size)
 static void
 print_object_id(uint8_t type, uint64_t id)
 {
-	printf("id:    %c%-15jd ", g_histories->object[type].id_prefix, id);
+	printf("id:    %c%-15jd ", g_histories->flags.object[type].id_prefix, id);
 }
 
 static void
@@ -149,13 +135,15 @@ print_float(const char *arg_string, float arg)
 static void
 print_arg(bool arg_is_ptr, const char *arg_string, uint64_t arg)
 {
-	if (arg_string[0] == 0)
+	if (arg_string[0] == 0) {
 		return;
+	}
 
-	if (arg_is_ptr)
+	if (arg_is_ptr) {
 		print_ptr(arg_string, arg);
-	else
+	} else {
 		print_uint64(arg_string, arg);
+	}
 }
 
 static void
@@ -166,7 +154,7 @@ print_event(struct spdk_trace_entry *e, uint64_t tsc_rate,
 	struct object_stats		*stats;
 	float				us;
 
-	d = &g_histories->tpoint[e->tpoint_id];
+	d = &g_histories->flags.tpoint[e->tpoint_id];
 	stats = &g_stats[d->object_type];
 
 	if (d->new_object) {
@@ -185,8 +173,8 @@ print_event(struct spdk_trace_entry *e, uint64_t tsc_rate,
 	us = get_us_from_tsc(e->tsc - tsc_offset, tsc_rate);
 
 	printf("%2d: %10.3f (%9ju) ", lcore, us, e->tsc - tsc_offset);
-	if (g_histories->owner[d->owner_type].id_prefix) {
-		printf("%c%02d ", g_histories->owner[d->owner_type].id_prefix, e->poller_id);
+	if (g_histories->flags.owner[d->owner_type].id_prefix) {
+		printf("%c%02d ", g_histories->flags.owner[d->owner_type].id_prefix, e->poller_id);
 	} else {
 		printf("%4s", " ");
 	}
@@ -205,7 +193,7 @@ print_event(struct spdk_trace_entry *e, uint64_t tsc_rate,
 					     tsc_rate);
 			print_object_id(d->object_type, stats->index[e->object_id]);
 			print_float("time:", us);
-			start_description = &g_histories->tpoint[stats->tpoint_id[e->object_id]];
+			start_description = &g_histories->flags.tpoint[stats->tpoint_id[e->object_id]];
 			if (start_description->short_name[0] != 0) {
 				printf(" (%.4s)", start_description->short_name);
 			}
@@ -250,19 +238,23 @@ populate_events(struct spdk_trace_history *history)
 	if (num_entries == num_entries_filled) {
 		first = last = 0;
 		for (i = 1; i < num_entries; i++) {
-			if (e[i].tsc < e[first].tsc)
+			if (e[i].tsc < e[first].tsc) {
 				first = i;
-			if (e[i].tsc > e[last].tsc)
+			}
+			if (e[i].tsc > e[last].tsc) {
 				last = i;
+			}
 		}
 
 		first += g_fudge_factor;
-		if (first >= num_entries)
+		if (first >= num_entries) {
 			first -= num_entries;
+		}
 
 		last -= g_fudge_factor;
-		if (last < 0)
+		if (last < 0) {
 			last += num_entries;
+		}
 	} else {
 		first = 0;
 		last = num_entries_filled - 1;
@@ -306,7 +298,9 @@ static void usage(void)
 	fprintf(stderr, "                 '-c' to display single lcore history\n");
 	fprintf(stderr, "                 '-f' to specify number of events to ignore at\n");
 	fprintf(stderr, "                      beginning and end of trace (default: 20)\n");
-	fprintf(stderr, "                 '-i' to specify the instance ID, (default: 0)\n");
+	fprintf(stderr, "                 '-i' to specify the shared memory ID\n");
+	fprintf(stderr, "                 '-p' to specify the trace PID\n");
+	fprintf(stderr, "                 (One of -i or -p must be specified)\n");
 }
 
 int main(int argc, char **argv)
@@ -316,12 +310,13 @@ int main(int argc, char **argv)
 	int			fd, i;
 	int			lcore = SPDK_TRACE_MAX_LCORE;
 	uint64_t		tsc_offset;
-	const char		*app_name = "ids";
+	const char		*app_name = "spdk";
 	int			op;
 	char			shm_name[64];
+	int			shm_id = -1, shm_pid = -1;
 
 	exe_name = argv[0];
-	while ((op = getopt(argc, argv, "c:f:i:qs:")) != -1) {
+	while ((op = getopt(argc, argv, "c:f:i:p:qs:")) != -1) {
 		switch (op) {
 		case 'c':
 			lcore = atoi(optarg);
@@ -336,7 +331,10 @@ int main(int argc, char **argv)
 			g_fudge_factor = atoi(optarg);
 			break;
 		case 'i':
-			g_instance_id = atoi(optarg);
+			shm_id = atoi(optarg);
+			break;
+		case 'p':
+			shm_pid = atoi(optarg);
 			break;
 		case 'q':
 			verbose = 0;
@@ -350,17 +348,34 @@ int main(int argc, char **argv)
 		}
 	}
 
-	snprintf(shm_name, sizeof(shm_name), "/%s_trace.%d", app_name, g_instance_id);
+	if (shm_id >= 0) {
+		snprintf(shm_name, sizeof(shm_name), "/%s_trace.%d", app_name, shm_id);
+	} else {
+		snprintf(shm_name, sizeof(shm_name), "/%s_trace.pid%d", app_name, shm_pid);
+	}
+
 	fd = shm_open(shm_name, O_RDONLY, 0600);
 	if (fd < 0) {
 		fprintf(stderr, "Could not open shm %s.\n", shm_name);
 		usage();
 		exit(-1);
 	}
+
 	history_ptr = mmap(NULL, sizeof(*g_histories), PROT_READ, MAP_SHARED, fd, 0);
+	if (history_ptr == MAP_FAILED) {
+		fprintf(stderr, "Could not mmap shm %s.\n", shm_name);
+		usage();
+		exit(-1);
+	}
+
 	g_histories = (struct spdk_trace_histories *)history_ptr;
 
-	tsc_rate = g_histories->tsc_rate;
+	tsc_rate = g_histories->flags.tsc_rate;
+	if (tsc_rate == 0) {
+		fprintf(stderr, "Invalid tsc_rate %ju\n", tsc_rate);
+		usage();
+		exit(-1);
+	}
 
 	if (verbose) {
 		printf("TSC Rate: %ju\n", tsc_rate);

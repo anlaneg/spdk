@@ -2,11 +2,11 @@
 
 testdir=$(readlink -f $(dirname $0))
 rootdir=$(readlink -f $testdir/../../..)
-source $rootdir/scripts/autotest_common.sh
+source $rootdir/test/common/autotest_common.sh
 source $rootdir/test/nvmf/common.sh
 
-MALLOC_BDEV_SIZE=64
-MALLOC_BLOCK_SIZE=512
+NULL_BDEV_SIZE=102400
+NULL_BLOCK_SIZE=512
 
 rpc_py="python $rootdir/scripts/rpc.py"
 
@@ -17,32 +17,33 @@ if ! hash nvme; then
 	exit 0
 fi
 
-if ! rdma_nic_available; then
+RDMA_IP_LIST=$(get_available_rdma_ips)
+NVMF_FIRST_TARGET_IP=$(echo "$RDMA_IP_LIST" | head -n 1)
+if [ -z $NVMF_FIRST_TARGET_IP ]; then
 	echo "no NIC for nvmf test"
 	exit 0
 fi
 
 timing_enter discovery
-
+timing_enter start_nvmf_tgt
 # Start up the NVMf target in another process
-$rootdir/app/nvmf_tgt/nvmf_tgt -c $testdir/../nvmf.conf &
+$NVMF_APP -c $testdir/../nvmf.conf &
 nvmfpid=$!
 
 trap "killprocess $nvmfpid; exit 1" SIGINT SIGTERM EXIT
 
-waitforlisten $nvmfpid ${RPC_PORT}
+waitforlisten $nvmfpid
+timing_exit start_nvmf_tgt
 
-bdevs="$bdevs $($rpc_py construct_malloc_bdev $MALLOC_BDEV_SIZE $MALLOC_BLOCK_SIZE)"
-bdevs="$bdevs $($rpc_py construct_malloc_bdev $MALLOC_BDEV_SIZE $MALLOC_BLOCK_SIZE)"
+null_bdevs="$($rpc_py construct_null_bdev Null0 $NULL_BDEV_SIZE $NULL_BLOCK_SIZE) "
+null_bdevs+="$($rpc_py construct_null_bdev Null1 $NULL_BDEV_SIZE $NULL_BLOCK_SIZE)"
 
 modprobe -v nvme-rdma
 
-if [ -e "/dev/nvme-fabrics" ]; then
-	chmod a+rw /dev/nvme-fabrics
-fi
-
-$rpc_py construct_nvmf_subsystem Direct nqn.2016-06.io.spdk:cnode1 'transport:RDMA traddr:192.168.100.8 trsvcid:4420' '' -p "*"
-$rpc_py construct_nvmf_subsystem Virtual nqn.2016-06.io.spdk:cnode2 'transport:RDMA traddr:192.168.100.8 trsvcid:4420' '' -s SPDK00000000000001 -n "$bdevs"
+$rpc_py construct_nvmf_subsystem nqn.2016-06.io.spdk:cnode1 "trtype:RDMA traddr:$NVMF_FIRST_TARGET_IP trsvcid:4420" "" -a -s SPDK00000000000001
+for null_bdev in $null_bdevs; do
+	$rpc_py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 $null_bdev
+done
 
 nvme discover -t rdma -a $NVMF_FIRST_TARGET_IP -s $NVMF_PORT
 
@@ -50,7 +51,16 @@ echo "Perform nvmf subsystem discovery via RPC"
 $rpc_py get_nvmf_subsystems
 
 $rpc_py delete_nvmf_subsystem nqn.2016-06.io.spdk:cnode1
-$rpc_py delete_nvmf_subsystem nqn.2016-06.io.spdk:cnode2
+
+for null_bdev in $null_bdevs; do
+	$rpc_py delete_null_bdev $null_bdev
+done
+
+check_bdevs=$($rpc_py get_bdevs | jq -r '.[].name')
+if [ -n "$check_bdevs" ]; then
+	echo $check_bdevs
+	exit 1
+fi
 
 trap - SIGINT SIGTERM EXIT
 

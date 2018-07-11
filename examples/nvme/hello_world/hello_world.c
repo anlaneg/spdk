@@ -31,13 +31,7 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-
-#include <rte_config.h>
-#include <rte_eal.h>
+#include "spdk/stdinc.h"
 
 #include "spdk/nvme.h"
 #include "spdk/env.h"
@@ -99,6 +93,7 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 struct hello_world_sequence {
 	struct ns_entry	*ns_entry;
 	char		*buf;
+	unsigned        using_cmb_io;
 	int		is_completed;
 };
 
@@ -114,7 +109,7 @@ read_complete(void *arg, const struct spdk_nvme_cpl *completion)
 	 *  to exit its polling loop.
 	 */
 	printf("%s", sequence->buf);
-	spdk_free(sequence->buf);
+	spdk_dma_free(sequence->buf);
 	sequence->is_completed = 1;
 }
 
@@ -130,8 +125,12 @@ write_complete(void *arg, const struct spdk_nvme_cpl *completion)
 	 *  the write I/O and allocate a new zeroed buffer for reading
 	 *  the data back from the NVMe namespace.
 	 */
-	spdk_free(sequence->buf);
-	sequence->buf = spdk_zmalloc(0x1000, 0x1000, NULL);
+	if (sequence->using_cmb_io) {
+		spdk_nvme_ctrlr_free_cmb_io_buffer(ns_entry->ctrlr, sequence->buf, 0x1000);
+	} else {
+		spdk_dma_free(sequence->buf);
+	}
+	sequence->buf = spdk_dma_zmalloc(0x1000, 0x1000, NULL);
 
 	rc = spdk_nvme_ns_cmd_read(ns_entry->ns, ns_entry->qpair, sequence->buf,
 				   0, /* LBA start */
@@ -164,18 +163,32 @@ hello_world(void)
 		 *  qpair.  This enables extremely efficient I/O processing by making all
 		 *  I/O operations completely lockless.
 		 */
-		ns_entry->qpair = spdk_nvme_ctrlr_alloc_io_qpair(ns_entry->ctrlr, 0);
+		ns_entry->qpair = spdk_nvme_ctrlr_alloc_io_qpair(ns_entry->ctrlr, NULL, 0);
 		if (ns_entry->qpair == NULL) {
 			printf("ERROR: spdk_nvme_ctrlr_alloc_io_qpair() failed\n");
 			return;
 		}
 
 		/*
-		 * Use spdk_zmalloc to allocate a 4KB zeroed buffer.  This memory
+		 * Use spdk_dma_zmalloc to allocate a 4KB zeroed buffer.  This memory
 		 * will be pinned, which is required for data buffers used for SPDK NVMe
 		 * I/O operations.
 		 */
-		sequence.buf = spdk_zmalloc(0x1000, 0x1000, NULL);
+		sequence.using_cmb_io = 1;
+		sequence.buf = spdk_nvme_ctrlr_alloc_cmb_io_buffer(ns_entry->ctrlr, 0x1000);
+		if (sequence.buf == NULL) {
+			sequence.using_cmb_io = 0;
+			sequence.buf = spdk_dma_zmalloc(0x1000, 0x1000, NULL);
+		}
+		if (sequence.buf == NULL) {
+			printf("ERROR: write buffer allocation failed\n");
+			return;
+		}
+		if (sequence.using_cmb_io) {
+			printf("INFO: using controller memory buffer for IO\n");
+		} else {
+			printf("INFO: using host memory buffer for IO\n");
+		}
 		sequence.is_completed = 0;
 		sequence.ns_entry = ns_entry;
 
@@ -184,7 +197,7 @@ hello_world(void)
 		 *  0 on the namespace, and then later read it back into a separate buffer
 		 *  to demonstrate the full I/O path.
 		 */
-		sprintf(sequence.buf, "Hello world!\n");
+		snprintf(sequence.buf, 0x1000, "%s", "Hello world!\n");
 
 		/*
 		 * Write the data buffer to LBA 0 of this namespace.  "write_complete" and
@@ -252,6 +265,7 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 {
 	int nsid, num_ns;
 	struct ctrlr_entry *entry;
+	struct spdk_nvme_ns *ns;
 	const struct spdk_nvme_ctrlr_data *cdata = spdk_nvme_ctrlr_get_data(ctrlr);
 
 	entry = malloc(sizeof(struct ctrlr_entry));
@@ -269,7 +283,7 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	g_controllers = entry;
 
 	/*
-	 * Each controller has one of more namespaces.  An NVMe namespace is basically
+	 * Each controller has one or more namespaces.  An NVMe namespace is basically
 	 *  equivalent to a SCSI LUN.  The controller's IDENTIFY data tells us how
 	 *  many namespaces exist on the controller.  For Intel(R) P3X00 controllers,
 	 *  it will just be one namespace.
@@ -279,7 +293,11 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	num_ns = spdk_nvme_ctrlr_get_num_ns(ctrlr);
 	printf("Using controller %s with %d namespaces.\n", entry->name, num_ns);
 	for (nsid = 1; nsid <= num_ns; nsid++) {
-		register_ns(ctrlr, spdk_nvme_ctrlr_get_ns(ctrlr, nsid));
+		ns = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
+		if (ns == NULL) {
+			continue;
+		}
+		register_ns(ctrlr, ns);
 	}
 }
 
@@ -304,30 +322,22 @@ cleanup(void)
 	}
 }
 
-static char *ealargs[] = {
-	"hello_world",
-	"-c 0x1",
-	"-n 4",
-	"--proc-type=auto",
-};
-
 int main(int argc, char **argv)
 {
 	int rc;
+	struct spdk_env_opts opts;
 
 	/*
-	 * By default, the SPDK NVMe driver uses DPDK for huge page-based
-	 *  memory management and NVMe request buffer pools.  Huge pages can
-	 *  be either 2MB or 1GB in size (instead of 4KB) and are pinned in
-	 *  memory.  Pinned memory is important to ensure DMA operations
-	 *  never target swapped out memory.
+	 * SPDK relies on an abstraction around the local environment
+	 * named env that handles memory allocation and PCI device operations.
+	 * This library must be initialized first.
 	 *
-	 * So first we must initialize DPDK.  "-c 0x1" indicates to only use
-	 *  core 0.
 	 */
-	rc = rte_eal_init(sizeof(ealargs) / sizeof(ealargs[0]), ealargs);
-	if (rc < 0) {
-		fprintf(stderr, "could not initialize dpdk\n");
+	spdk_env_opts_init(&opts);
+	opts.name = "hello_world";
+	opts.shm_id = 0;
+	if (spdk_env_init(&opts) < 0) {
+		fprintf(stderr, "Unable to initialize SPDK env\n");
 		return 1;
 	}
 
@@ -343,6 +353,12 @@ int main(int argc, char **argv)
 	rc = spdk_nvme_probe(NULL, NULL, probe_cb, attach_cb, NULL);
 	if (rc != 0) {
 		fprintf(stderr, "spdk_nvme_probe() failed\n");
+		cleanup();
+		return 1;
+	}
+
+	if (g_controllers == NULL) {
+		fprintf(stderr, "no NVMe controllers found\n");
 		cleanup();
 		return 1;
 	}

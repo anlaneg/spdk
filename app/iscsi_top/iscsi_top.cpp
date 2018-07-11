@@ -31,19 +31,8 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <sys/types.h>
-#include <sys/uio.h>
+#include "spdk/stdinc.h"
 
-#include <fcntl.h>
-#include <inttypes.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <string.h>
-#include <errno.h>
-#include <unistd.h>
-#include <signal.h>
-#include <termios.h>
 #include <algorithm>
 #include <map>
 #include <vector>
@@ -54,27 +43,30 @@ extern "C" {
 }
 
 static char *exe_name;
-static int g_instance_id = 0;
+static int g_shm_id = 0;
 
 static void usage(void)
 {
 	fprintf(stderr, "usage:\n");
 	fprintf(stderr, "   %s <option>\n", exe_name);
-	fprintf(stderr, "        option = '-i' to specify the instance ID,"
-		" (default: 0)\n");
+	fprintf(stderr, "        option = '-i' to specify the shared memory ID,"
+		" (required)\n");
 }
 
 static bool
 conns_compare(struct spdk_iscsi_conn *first, struct spdk_iscsi_conn *second)
 {
-	if (first->lcore < second->lcore)
+	if (first->lcore < second->lcore) {
 		return true;
+	}
 
-	if (first->lcore > second->lcore)
+	if (first->lcore > second->lcore) {
 		return false;
+	}
 
-	if (first->id < second->id)
+	if (first->id < second->id) {
 		return true;
+	}
 
 	return false;
 }
@@ -90,7 +82,7 @@ print_connections(void)
 	int			fd, i;
 	char			shm_name[64];
 
-	sprintf(shm_name, "spdk_iscsi_conns.%d", g_instance_id);
+	snprintf(shm_name, sizeof(shm_name), "/spdk_iscsi_conns.%d", g_shm_id);
 	fd = shm_open(shm_name, O_RDONLY, 0600);
 	if (fd < 0) {
 		fprintf(stderr, "Cannot open shared memory: %s\n", shm_name);
@@ -101,8 +93,8 @@ print_connections(void)
 	conns_size = sizeof(*conns) * MAX_ISCSI_CONNECTIONS;
 
 	conns_ptr = mmap(NULL, conns_size, PROT_READ, MAP_SHARED, fd, 0);
-	if (conns_ptr == NULL) {
-		fprintf(stderr, "Cannot mmap shared memory\n");
+	if (conns_ptr == MAP_FAILED) {
+		fprintf(stderr, "Cannot mmap shared memory (%d)\n", errno);
 		exit(1);
 	}
 
@@ -136,7 +128,7 @@ int main(int argc, char **argv)
 	struct spdk_trace_history *history;
 
 	uint64_t		tasks_done, last_tasks_done[SPDK_TRACE_MAX_LCORE];
-	int			delay, history_fd, i, quit, rc;
+	int			delay, old_delay, history_fd, i, quit, rc;
 	int			tasks_done_delta, tasks_done_per_sec;
 	int			total_tasks_done_per_sec;
 	struct timeval		timeout;
@@ -150,7 +142,7 @@ int main(int argc, char **argv)
 	while ((op = getopt(argc, argv, "i:")) != -1) {
 		switch (op) {
 		case 'i':
-			g_instance_id = atoi(optarg);
+			g_shm_id = atoi(optarg);
 			break;
 		default:
 			usage();
@@ -158,7 +150,7 @@ int main(int argc, char **argv)
 		}
 	}
 
-	sprintf(spdk_trace_shm_name, "/iscsi_trace.%d", g_instance_id);
+	snprintf(spdk_trace_shm_name, sizeof(spdk_trace_shm_name), "/iscsi_trace.%d", g_shm_id);
 	history_fd = shm_open(spdk_trace_shm_name, O_RDONLY, 0600);
 	if (history_fd < 0) {
 		fprintf(stderr, "Unable to open history shm %s\n", spdk_trace_shm_name);
@@ -167,8 +159,8 @@ int main(int argc, char **argv)
 	}
 
 	history_ptr = mmap(NULL, sizeof(*histories), PROT_READ, MAP_SHARED, history_fd, 0);
-	if (history_ptr == NULL) {
-		fprintf(stderr, "Unable to mmap history shm\n");
+	if (history_ptr == MAP_FAILED) {
+		fprintf(stderr, "Unable to mmap history shm (%d).\n", errno);
 		exit(1);
 	}
 
@@ -207,9 +199,11 @@ int main(int argc, char **argv)
 			switch (ch) {
 			case 'd':
 				printf("Enter num seconds to delay (1-10): ");
+				old_delay = delay;
 				rc = scanf("%d", &delay);
 				if (rc != 1) {
-					break;
+					fprintf(stderr, "Illegal delay value\n");
+					delay = old_delay;
 				} else if (delay < 1 || delay > 10) {
 					delay = 1;
 				}

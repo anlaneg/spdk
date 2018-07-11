@@ -31,7 +31,9 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "json_internal.h"
+#include "spdk/json.h"
+
+#include "spdk_internal/utf.h"
 
 size_t
 spdk_json_val_len(const struct spdk_json_val *val)
@@ -92,65 +94,204 @@ spdk_json_strdup(const struct spdk_json_val *val)
 	return s;
 }
 
-int
-spdk_json_number_to_double(const struct spdk_json_val *val, double *num)
+struct spdk_json_num {
+	bool negative;
+	uint64_t significand;
+	int64_t exponent;
+};
+
+static int
+spdk_json_number_split(const struct spdk_json_val *val, struct spdk_json_num *num)
 {
-	char buf[32];
-	char *end;
+	const char *iter;
+	size_t remaining;
+	uint64_t *pval;
+	uint64_t frac_digits = 0;
+	uint64_t exponent_u64 = 0;
+	bool exponent_negative = false;
+	enum {
+		NUM_STATE_INT,
+		NUM_STATE_FRAC,
+		NUM_STATE_EXP,
+	} state;
 
-	if (val->type != SPDK_JSON_VAL_NUMBER || val->len >= sizeof(buf)) {
-		*num = 0.0;
-		return -1;
+	memset(num, 0, sizeof(*num));
+
+	if (val->type != SPDK_JSON_VAL_NUMBER) {
+		return -EINVAL;
 	}
 
-	memcpy(buf, val->start, val->len);
-	buf[val->len] = '\0';
-
-	errno = 0;
-	/* TODO: strtod() uses locale for decimal point (. is not guaranteed) */
-	*num = strtod(buf, &end);
-	if (*end != '\0' || errno != 0) {
-		return -1;
+	remaining = val->len;
+	if (remaining == 0) {
+		return -EINVAL;
 	}
 
+	iter = val->start;
+	if (*iter == '-') {
+		num->negative = true;
+		iter++;
+		remaining--;
+	}
+
+	state = NUM_STATE_INT;
+	pval = &num->significand;
+	while (remaining--) {
+		char c = *iter++;
+
+		if (c == '.') {
+			state = NUM_STATE_FRAC;
+		} else if (c == 'e' || c == 'E') {
+			state = NUM_STATE_EXP;
+			pval = &exponent_u64;
+		} else if (c == '-') {
+			assert(state == NUM_STATE_EXP);
+			exponent_negative = true;
+		} else if (c == '+') {
+			assert(state == NUM_STATE_EXP);
+			/* exp_negative = false; */ /* already false by default */
+		} else {
+			uint64_t new_val;
+
+			assert(c >= '0' && c <= '9');
+			new_val = *pval * 10 + c - '0';
+			if (new_val < *pval) {
+				return -ERANGE;
+			}
+
+			if (state == NUM_STATE_FRAC) {
+				frac_digits++;
+			}
+
+			*pval = new_val;
+		}
+	}
+
+	if (exponent_negative) {
+		if (exponent_u64 > 9223372036854775808ULL) { /* abs(INT64_MIN) */
+			return -ERANGE;
+		}
+		num->exponent = (int64_t) - exponent_u64;
+	} else {
+		if (exponent_u64 > INT64_MAX) {
+			return -ERANGE;
+		}
+		num->exponent = exponent_u64;
+	}
+	num->exponent -= frac_digits;
+
+	/* Apply as much of the exponent as possible without overflow or truncation */
+	if (num->exponent < 0) {
+		while (num->exponent && num->significand >= 10 && num->significand % 10 == 0) {
+			num->significand /= 10;
+			num->exponent++;
+		}
+	} else { /* positive exponent */
+		while (num->exponent) {
+			uint64_t new_val = num->significand * 10;
+
+			if (new_val < num->significand) {
+				break;
+			}
+
+			num->significand = new_val;
+			num->exponent--;
+		}
+	}
+
+	return 0;
+}
+
+int
+spdk_json_number_to_uint16(const struct spdk_json_val *val, uint16_t *num)
+{
+	struct spdk_json_num split_num;
+	int rc;
+
+	rc = spdk_json_number_split(val, &split_num);
+	if (rc) {
+		return rc;
+	}
+
+	if (split_num.exponent || split_num.negative) {
+		return -ERANGE;
+	}
+
+	if (split_num.significand > UINT16_MAX) {
+		return -ERANGE;
+	}
+	*num = (uint16_t)split_num.significand;
 	return 0;
 }
 
 int
 spdk_json_number_to_int32(const struct spdk_json_val *val, int32_t *num)
 {
-	double dbl;
+	struct spdk_json_num split_num;
+	int rc;
 
-	if (spdk_json_number_to_double(val, &dbl)) {
-		return -1;
+	rc = spdk_json_number_split(val, &split_num);
+	if (rc) {
+		return rc;
 	}
 
-	*num = (int32_t)dbl;
-	if (dbl != (double)*num) {
-		return -1;
+	if (split_num.exponent) {
+		return -ERANGE;
 	}
 
+	if (split_num.negative) {
+		if (split_num.significand > 2147483648) { /* abs(INT32_MIN) */
+			return -ERANGE;
+		}
+		*num = (int32_t) - (int64_t)split_num.significand;
+		return 0;
+	}
+
+	/* positive */
+	if (split_num.significand > INT32_MAX) {
+		return -ERANGE;
+	}
+	*num = (int32_t)split_num.significand;
 	return 0;
 }
 
 int
 spdk_json_number_to_uint32(const struct spdk_json_val *val, uint32_t *num)
 {
-	double dbl;
+	struct spdk_json_num split_num;
+	int rc;
 
-	if (spdk_json_number_to_double(val, &dbl)) {
-		return -1;
+	rc = spdk_json_number_split(val, &split_num);
+	if (rc) {
+		return rc;
 	}
 
-	if (dbl < 0) {
-		return -1;
+	if (split_num.exponent || split_num.negative) {
+		return -ERANGE;
 	}
 
-	*num = (uint32_t)dbl;
-	if (dbl != (double)*num) {
-		return -1;
+	if (split_num.significand > UINT32_MAX) {
+		return -ERANGE;
+	}
+	*num = (uint32_t)split_num.significand;
+	return 0;
+}
+
+int
+spdk_json_number_to_uint64(const struct spdk_json_val *val, uint64_t *num)
+{
+	struct spdk_json_num split_num;
+	int rc;
+
+	rc = spdk_json_number_split(val, &split_num);
+	if (rc) {
+		return rc;
 	}
 
+	if (split_num.exponent || split_num.negative) {
+		return -ERANGE;
+	}
+
+	*num = split_num.significand;
 	return 0;
 }
 
@@ -223,19 +364,21 @@ spdk_json_decode_array(const struct spdk_json_val *values, spdk_json_decode_fn d
 {
 	uint32_t i;
 	char *field;
+	char *out_end;
 
 	if (values == NULL || values->type != SPDK_JSON_VAL_ARRAY_BEGIN) {
 		return -1;
 	}
 
-	if (values->len >= max_size) {
-		return -1;
-	}
-
 	*out_size = 0;
 	field = out;
+	out_end = field + max_size * stride;
 	for (i = 0; i < values->len;) {
 		const struct spdk_json_val *v = &values[i + 1];
+
+		if (field == out_end) {
+			return -1;
+		}
 
 		if (decode_func(v, field)) {
 			return -1;
@@ -247,6 +390,27 @@ spdk_json_decode_array(const struct spdk_json_val *values, spdk_json_decode_fn d
 	}
 
 	return 0;
+}
+
+int
+spdk_json_decode_bool(const struct spdk_json_val *val, void *out)
+{
+	bool *f = out;
+
+	if (val->type != SPDK_JSON_VAL_TRUE && val->type != SPDK_JSON_VAL_FALSE) {
+		return -1;
+	}
+
+	*f = val->type == SPDK_JSON_VAL_TRUE;
+	return 0;
+}
+
+int
+spdk_json_decode_uint16(const struct spdk_json_val *val, void *out)
+{
+	uint16_t *i = out;
+
+	return spdk_json_number_to_uint16(val, i);
 }
 
 int
@@ -266,13 +430,19 @@ spdk_json_decode_uint32(const struct spdk_json_val *val, void *out)
 }
 
 int
+spdk_json_decode_uint64(const struct spdk_json_val *val, void *out)
+{
+	uint64_t *i = out;
+
+	return spdk_json_number_to_uint64(val, i);
+}
+
+int
 spdk_json_decode_string(const struct spdk_json_val *val, void *out)
 {
 	char **s = out;
 
-	if (*s) {
-		free(*s);
-	}
+	free(*s);
 
 	*s = spdk_json_strdup(val);
 

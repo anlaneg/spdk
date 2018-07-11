@@ -31,95 +31,176 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <assert.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <sys/select.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <unistd.h>
-#include <errno.h>
-#include <string.h>
+#include <sys/file.h>
+
+#include "spdk/stdinc.h"
 
 #include "spdk/queue.h"
 #include "spdk/rpc.h"
 #include "spdk/env.h"
-#include "spdk/event.h"
-#include "spdk/conf.h"
 #include "spdk/log.h"
+#include "spdk/string.h"
+#include "spdk/util.h"
 
-#define RPC_SELECT_INTERVAL	4000 /* 4ms */
-#define RPC_DEFAULT_LISTEN_ADDR	"127.0.0.1"
+#define RPC_DEFAULT_PORT	"5260"
 
 static struct sockaddr_un g_rpc_listen_addr_unix = {};
-
-static struct spdk_poller *g_rpc_poller = NULL;
+static char g_rpc_lock_path[sizeof(g_rpc_listen_addr_unix.sun_path) + sizeof(".lock") + 1];
+static int g_rpc_lock_fd = -1;
 
 static struct spdk_jsonrpc_server *g_jsonrpc_server = NULL;
+static uint32_t g_rpc_state;
 
 struct spdk_rpc_method {
 	const char *name;
 	spdk_rpc_method_handler func;
 	SLIST_ENTRY(spdk_rpc_method) slist;
+	uint32_t state_mask;
 };
 
 static SLIST_HEAD(, spdk_rpc_method) g_rpc_methods = SLIST_HEAD_INITIALIZER(g_rpc_methods);
 
-static void
-spdk_rpc_server_do_work(void *arg)
+void
+spdk_rpc_set_state(uint32_t state)
 {
-	spdk_jsonrpc_server_poll(g_jsonrpc_server);
+	g_rpc_state = state;
 }
 
-static int
-enable_rpc(void)
+static void
+spdk_jsonrpc_handler(struct spdk_jsonrpc_request *request,
+		     const struct spdk_json_val *method,
+		     const struct spdk_json_val *params)
 {
-	struct spdk_conf_section	*sp;
-	char				*val;
+	struct spdk_rpc_method *m;
 
-	sp = spdk_conf_find_section(NULL, "Rpc");
-	if (sp == NULL) {
-		return 0;
+	assert(method != NULL);
+
+	SLIST_FOREACH(m, &g_rpc_methods, slist) {
+		if (spdk_json_strequal(method, m->name)) {
+			if ((m->state_mask & g_rpc_state) == g_rpc_state) {
+				m->func(request, params);
+			} else {
+				spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_STATE,
+								     "Method is allowed in any state in the mask (%"PRIx32"),"
+								     " but current state is (%"PRIx32")",
+								     m->state_mask, g_rpc_state);
+			}
+			return;
+		}
 	}
 
-	val = spdk_conf_section_get_val(sp, "Enable");
-	if (val == NULL) {
-		return 0;
+	spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_METHOD_NOT_FOUND, "Method not found");
+}
+
+int
+spdk_rpc_listen(const char *listen_addr)
+{
+	struct addrinfo		hints;
+	struct addrinfo		*res;
+
+	memset(&g_rpc_listen_addr_unix, 0, sizeof(g_rpc_listen_addr_unix));
+
+	if (listen_addr[0] == '/') {
+		int rc;
+
+		g_rpc_listen_addr_unix.sun_family = AF_UNIX;
+		rc = snprintf(g_rpc_listen_addr_unix.sun_path,
+			      sizeof(g_rpc_listen_addr_unix.sun_path),
+			      "%s", listen_addr);
+		if (rc < 0 || (size_t)rc >= sizeof(g_rpc_listen_addr_unix.sun_path)) {
+			SPDK_ERRLOG("RPC Listen address Unix socket path too long\n");
+			g_rpc_listen_addr_unix.sun_path[0] = '\0';
+			return -1;
+		}
+
+		snprintf(g_rpc_lock_path, sizeof(g_rpc_lock_path), "%s.lock",
+			 g_rpc_listen_addr_unix.sun_path);
+
+		g_rpc_lock_fd = open(g_rpc_lock_path, O_RDONLY | O_CREAT, 0600);
+		if (g_rpc_lock_fd == -1) {
+			SPDK_ERRLOG("Cannot open lock file %s: %s\n",
+				    g_rpc_lock_path, spdk_strerror(errno));
+			return -1;
+		}
+
+		rc = flock(g_rpc_lock_fd, LOCK_EX | LOCK_NB);
+		if (rc != 0) {
+			SPDK_ERRLOG("RPC Unix domain socket path %s in use. Specify another.\n",
+				    g_rpc_listen_addr_unix.sun_path);
+			return -1;
+		}
+
+		/*
+		 * Since we acquired the lock, it is safe to delete the Unix socket file
+		 * if it still exists from a previous process.
+		 */
+		unlink(g_rpc_listen_addr_unix.sun_path);
+
+		g_jsonrpc_server = spdk_jsonrpc_server_listen(AF_UNIX, 0,
+				   (struct sockaddr *)&g_rpc_listen_addr_unix,
+				   sizeof(g_rpc_listen_addr_unix),
+				   spdk_jsonrpc_handler);
+		if (g_jsonrpc_server == NULL) {
+			close(g_rpc_lock_fd);
+			g_rpc_lock_fd = -1;
+			unlink(g_rpc_lock_path);
+			g_rpc_lock_path[0] = '\0';
+		}
+	} else {
+		char *tmp;
+		char *host, *port;
+
+		tmp = strdup(listen_addr);
+		if (!tmp) {
+			SPDK_ERRLOG("Out of memory\n");
+			return -1;
+		}
+
+		if (spdk_parse_ip_addr(tmp, &host, &port) < 0) {
+			free(tmp);
+			SPDK_ERRLOG("Invalid listen address '%s'\n", listen_addr);
+			return -1;
+		}
+
+		if (port == NULL) {
+			port = RPC_DEFAULT_PORT;
+		}
+
+		memset(&hints, 0, sizeof(hints));
+		hints.ai_family = AF_UNSPEC;
+		hints.ai_socktype = SOCK_STREAM;
+		hints.ai_protocol = IPPROTO_TCP;
+
+		if (getaddrinfo(host, port, &hints, &res) != 0) {
+			free(tmp);
+			SPDK_ERRLOG("Unable to look up RPC listen address '%s'\n", listen_addr);
+			return -1;
+		}
+
+		g_jsonrpc_server = spdk_jsonrpc_server_listen(res->ai_family, res->ai_protocol,
+				   res->ai_addr, res->ai_addrlen,
+				   spdk_jsonrpc_handler);
+
+		freeaddrinfo(res);
+		free(tmp);
 	}
 
-	if (!strcmp(val, "Yes")) {
-		return 1;
+	if (g_jsonrpc_server == NULL) {
+		SPDK_ERRLOG("spdk_jsonrpc_server_listen() failed\n");
+		return -1;
 	}
 
 	return 0;
 }
 
-static const char *
-rpc_get_listen_addr(void)
+void
+spdk_rpc_accept(void)
 {
-	struct spdk_conf_section *sp;
-	const char *val;
-
-	sp = spdk_conf_find_section(NULL, "Rpc");
-	if (sp == NULL) {
-		return 0;
-	}
-
-	val = spdk_conf_section_get_val(sp, "Listen");
-	if (val == NULL) {
-		val = RPC_DEFAULT_LISTEN_ADDR;
-	}
-
-	return val;
+	spdk_jsonrpc_server_poll(g_jsonrpc_server);
 }
 
 void
-spdk_rpc_register_method(const char *method, spdk_rpc_method_handler func)
+spdk_rpc_register_method(const char *method, spdk_rpc_method_handler func, uint32_t state_mask)
 {
 	struct spdk_rpc_method *m;
 
@@ -130,158 +211,75 @@ spdk_rpc_register_method(const char *method, spdk_rpc_method_handler func)
 	assert(m->name != NULL);
 
 	m->func = func;
+	m->state_mask = state_mask;
 
 	/* TODO: use a hash table or sorted list */
 	SLIST_INSERT_HEAD(&g_rpc_methods, m, slist);
 }
 
-static void
-spdk_jsonrpc_handler(
-	struct spdk_jsonrpc_server_conn *conn,
-	const struct spdk_json_val *method,
-	const struct spdk_json_val *params,
-	const struct spdk_json_val *id)
-{
-	struct spdk_rpc_method *m;
-
-	assert(method != NULL);
-
-	SLIST_FOREACH(m, &g_rpc_methods, slist) {
-		if (spdk_json_strequal(method, m->name)) {
-			m->func(conn, params, id);
-			return;
-		}
-	}
-
-	spdk_jsonrpc_send_error_response(conn, id, SPDK_JSONRPC_ERROR_METHOD_NOT_FOUND, "Method not found");
-}
-
-static void
-spdk_rpc_setup(void *arg)
-{
-	uint16_t		port;
-	char			port_str[16];
-	struct addrinfo		hints;
-	struct addrinfo		*res;
-	const char		*listen_addr;
-
-	memset(&g_rpc_listen_addr_unix, 0, sizeof(g_rpc_listen_addr_unix));
-
-	/* Unregister the one-shot setup poller */
-	spdk_poller_unregister(&g_rpc_poller, NULL);
-
-	if (!enable_rpc()) {
-		return;
-	}
-
-	listen_addr = rpc_get_listen_addr();
-	if (!listen_addr) {
-		return;
-	}
-
-	if (listen_addr[0] == '/') {
-		int rc;
-
-		g_rpc_listen_addr_unix.sun_family = AF_UNIX;
-		rc = snprintf(g_rpc_listen_addr_unix.sun_path,
-			      sizeof(g_rpc_listen_addr_unix.sun_path),
-			      "%s.%d", listen_addr, spdk_app_get_instance_id());
-		if (rc < 0 || (size_t)rc >= sizeof(g_rpc_listen_addr_unix.sun_path)) {
-			SPDK_ERRLOG("RPC Listen address Unix socket path too long\n");
-			g_rpc_listen_addr_unix.sun_path[0] = '\0';
-			return;
-		}
-
-		unlink(g_rpc_listen_addr_unix.sun_path);
-
-		g_jsonrpc_server = spdk_jsonrpc_server_listen(AF_UNIX, 0,
-				   (struct sockaddr *)&g_rpc_listen_addr_unix,
-				   sizeof(g_rpc_listen_addr_unix),
-				   spdk_jsonrpc_handler);
-	} else {
-		port = SPDK_JSONRPC_PORT_BASE + spdk_app_get_instance_id();
-		snprintf(port_str, sizeof(port_str), "%" PRIu16, port);
-
-		memset(&hints, 0, sizeof(hints));
-		hints.ai_family = AF_UNSPEC;
-		hints.ai_socktype = SOCK_STREAM;
-		hints.ai_protocol = IPPROTO_TCP;
-
-		if (getaddrinfo(listen_addr, port_str, &hints, &res) != 0) {
-			SPDK_ERRLOG("Unable to look up RPC listen address '%s'\n", listen_addr);
-			return;
-		}
-
-		g_jsonrpc_server = spdk_jsonrpc_server_listen(res->ai_family, res->ai_protocol,
-				   res->ai_addr, res->ai_addrlen,
-				   spdk_jsonrpc_handler);
-
-		freeaddrinfo(res);
-	}
-
-	if (g_jsonrpc_server == NULL) {
-		SPDK_ERRLOG("spdk_jsonrpc_server_listen() failed\n");
-		return;
-	}
-
-	/* Register the periodic rpc_server_do_work */
-	spdk_poller_register(&g_rpc_poller, spdk_rpc_server_do_work, NULL, spdk_app_get_current_core(),
-			     NULL, RPC_SELECT_INTERVAL);
-}
-
-static int
-spdk_rpc_initialize(void)
-{
-	/*
-	 * Defer setup of the RPC service until the reactor has started.  This
-	 *  allows us to detect the RPC listen socket as a suitable proxy for determining
-	 *  when the SPDK application has finished initialization and ready for logins
-	 *  or RPC commands.
-	 */
-	spdk_poller_register(&g_rpc_poller, spdk_rpc_setup, NULL, spdk_app_get_current_core(),
-			     NULL, 0);
-	return 0;
-}
-
-static void
-spdk_rpc_finish_cleanup(struct spdk_event *event)
+void
+spdk_rpc_close(void)
 {
 	if (g_jsonrpc_server) {
+		if (g_rpc_listen_addr_unix.sun_path[0]) {
+			/* Delete the Unix socket file */
+			unlink(g_rpc_listen_addr_unix.sun_path);
+		}
+
 		spdk_jsonrpc_server_shutdown(g_jsonrpc_server);
+		g_jsonrpc_server = NULL;
+
+		if (g_rpc_lock_fd != -1) {
+			close(g_rpc_lock_fd);
+			g_rpc_lock_fd = -1;
+		}
+
+		if (g_rpc_lock_path[0]) {
+			unlink(g_rpc_lock_path);
+			g_rpc_lock_path[0] = '\0';
+		}
 	}
 }
 
-static int
-spdk_rpc_finish(void)
-{
-	struct spdk_event *complete;
+struct rpc_get_rpc_methods {
+	bool current;
+};
 
-	if (g_rpc_listen_addr_unix.sun_path[0]) {
-		/* Delete the Unix socket file */
-		unlink(g_rpc_listen_addr_unix.sun_path);
-	}
-
-	complete = spdk_event_allocate(spdk_app_get_current_core(), spdk_rpc_finish_cleanup,
-				       NULL, NULL, NULL);
-	spdk_poller_unregister(&g_rpc_poller, complete);
-	return 0;
-}
+static const struct spdk_json_object_decoder rpc_get_rpc_methods_decoders[] = {
+	{"current", offsetof(struct rpc_get_rpc_methods, current), spdk_json_decode_bool, true},
+};
 
 static void
-spdk_rpc_config_text(FILE *fp)
+spdk_rpc_get_rpc_methods(struct spdk_jsonrpc_request *request,
+			 const struct spdk_json_val *params)
 {
-	fprintf(fp,
-		"\n"
-		"[Rpc]\n"
-		"  # Defines whether to enable configuration via RPC.\n"
-		"  # Default is disabled.  Note that the RPC interface is not\n"
-		"  # authenticated, so users should be careful about enabling\n"
-		"  # RPC in non-trusted environments.\n"
-		"  Enable %s\n"
-		"  # Listen address for the RPC service.\n"
-		"  # May be an IP address or an absolute path to a Unix socket.\n"
-		"  Listen %s\n",
-		enable_rpc() ? "Yes" : "No", rpc_get_listen_addr());
-}
+	struct rpc_get_rpc_methods req = {};
+	struct spdk_json_write_ctx *w;
+	struct spdk_rpc_method *m;
 
-SPDK_SUBSYSTEM_REGISTER(spdk_rpc, spdk_rpc_initialize, spdk_rpc_finish, spdk_rpc_config_text)
+	if (params != NULL) {
+		if (spdk_json_decode_object(params, rpc_get_rpc_methods_decoders,
+					    SPDK_COUNTOF(rpc_get_rpc_methods_decoders), &req)) {
+			SPDK_ERRLOG("spdk_json_decode_object failed\n");
+			spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+							 "Invalid parameters");
+			return;
+		}
+	}
+
+	w = spdk_jsonrpc_begin_result(request);
+	if (w == NULL) {
+		return;
+	}
+
+	spdk_json_write_array_begin(w);
+	SLIST_FOREACH(m, &g_rpc_methods, slist) {
+		if (req.current && ((m->state_mask & g_rpc_state) != g_rpc_state)) {
+			continue;
+		}
+		spdk_json_write_string(w, m->name);
+	}
+	spdk_json_write_array_end(w);
+	spdk_jsonrpc_end_result(request, w);
+}
+SPDK_RPC_REGISTER("get_rpc_methods", spdk_rpc_get_rpc_methods, SPDK_RPC_STARTUP | SPDK_RPC_RUNTIME)

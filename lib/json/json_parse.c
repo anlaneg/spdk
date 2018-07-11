@@ -31,7 +31,11 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "json_internal.h"
+#include "spdk/json.h"
+
+#include "spdk_internal/utf.h"
+
+#define SPDK_JSON_MAX_NESTING_DEPTH	64
 
 static int
 hex_value(uint8_t c)
@@ -60,23 +64,23 @@ decode:
 	/* \uXXXX */
 	assert(buf_end > str);
 
-	if (*str++ != '\\') return SPDK_JSON_PARSE_INVALID;
-	if (buf_end == str) return SPDK_JSON_PARSE_INCOMPLETE;
+	if (*str++ != '\\') { return SPDK_JSON_PARSE_INVALID; }
+	if (buf_end == str) { return SPDK_JSON_PARSE_INCOMPLETE; }
 
-	if (*str++ != 'u') return SPDK_JSON_PARSE_INVALID;
-	if (buf_end == str) return SPDK_JSON_PARSE_INCOMPLETE;
+	if (*str++ != 'u') { return SPDK_JSON_PARSE_INVALID; }
+	if (buf_end == str) { return SPDK_JSON_PARSE_INCOMPLETE; }
 
-	if ((v3 = hex_value(*str++)) < 0) return SPDK_JSON_PARSE_INVALID;
-	if (buf_end == str) return SPDK_JSON_PARSE_INCOMPLETE;
+	if ((v3 = hex_value(*str++)) < 0) { return SPDK_JSON_PARSE_INVALID; }
+	if (buf_end == str) { return SPDK_JSON_PARSE_INCOMPLETE; }
 
-	if ((v2 = hex_value(*str++)) < 0) return SPDK_JSON_PARSE_INVALID;
-	if (buf_end == str) return SPDK_JSON_PARSE_INCOMPLETE;
+	if ((v2 = hex_value(*str++)) < 0) { return SPDK_JSON_PARSE_INVALID; }
+	if (buf_end == str) { return SPDK_JSON_PARSE_INCOMPLETE; }
 
-	if ((v1 = hex_value(*str++)) < 0) return SPDK_JSON_PARSE_INVALID;
-	if (buf_end == str) return SPDK_JSON_PARSE_INCOMPLETE;
+	if ((v1 = hex_value(*str++)) < 0) { return SPDK_JSON_PARSE_INVALID; }
+	if (buf_end == str) { return SPDK_JSON_PARSE_INCOMPLETE; }
 
-	if ((v0 = hex_value(*str++)) < 0) return SPDK_JSON_PARSE_INVALID;
-	if (buf_end == str) return SPDK_JSON_PARSE_INCOMPLETE;
+	if ((v0 = hex_value(*str++)) < 0) { return SPDK_JSON_PARSE_INVALID; }
+	if (buf_end == str) { return SPDK_JSON_PARSE_INCOMPLETE; }
 
 	val = v0 | (v1 << 4) | (v2 << 8) | (v3 << 12);
 
@@ -98,7 +102,7 @@ decode:
 		 *
 		 * Loop around to get the low half of the surrogate pair.
 		 */
-		if (buf_end == str) return SPDK_JSON_PARSE_INCOMPLETE;
+		if (buf_end == str) { return SPDK_JSON_PARSE_INCOMPLETE; }
 		goto decode;
 	} else if (utf16_valid_surrogate_low(val)) {
 		/*
@@ -202,10 +206,12 @@ json_decode_string(uint8_t *str_start, uint8_t *buf_end, uint8_t **str_end, uint
 		 * Shortest valid string (the empty string) is two bytes (""),
 		 *  so this can't possibly be valid
 		 */
+		*str_end = str;
 		return SPDK_JSON_PARSE_INCOMPLETE;
 	}
 
 	if (*str++ != '"') {
+		*str_end = str;
 		return SPDK_JSON_PARSE_INVALID;
 	}
 
@@ -222,17 +228,21 @@ json_decode_string(uint8_t *str_start, uint8_t *buf_end, uint8_t **str_end, uint
 						       flags & SPDK_JSON_PARSE_FLAG_DECODE_IN_PLACE ? out : NULL);
 			assert(rc != 0);
 			if (rc < 0) {
+				*str_end = str;
 				return rc;
 			}
 			out += rc;
 		} else if (str[0] <= 0x1f) {
 			/* control characters must be escaped */
+			*str_end = str;
 			return SPDK_JSON_PARSE_INVALID;
 		} else {
 			rc = utf8_valid(str, buf_end);
 			if (rc == 0) {
+				*str_end = str;
 				return SPDK_JSON_PARSE_INCOMPLETE;
 			} else if (rc < 0) {
+				*str_end = str;
 				return SPDK_JSON_PARSE_INVALID;
 			}
 
@@ -245,6 +255,7 @@ json_decode_string(uint8_t *str_start, uint8_t *buf_end, uint8_t **str_end, uint
 	}
 
 	/* If execution gets here, we ran out of buffer. */
+	*str_end = str;
 	return SPDK_JSON_PARSE_INCOMPLETE;
 }
 
@@ -252,125 +263,100 @@ static int
 json_valid_number(uint8_t *start, uint8_t *buf_end)
 {
 	uint8_t *p = start;
-	enum {
-		NUM_STATE_START,
-		NUM_STATE_INT_FIRST_DIGIT,
-		NUM_STATE_INT_DIGITS,
-		NUM_STATE_FRAC_OR_EXP,
-		NUM_STATE_FRAC_FIRST_DIGIT,
-		NUM_STATE_FRAC_DIGITS,
-		NUM_STATE_EXP_SIGN,
-		NUM_STATE_EXP_FIRST_DIGIT,
-		NUM_STATE_EXP_DIGITS,
-	} state = NUM_STATE_START;
+	uint8_t c;
 
-	if (p >= buf_end) return -1;
+	if (p >= buf_end) { return -1; }
 
-	while (p != buf_end) {
-		uint8_t c = *p++;
+	c = *p++;
+	if (c >= '1' && c <= '9') { goto num_int_digits; }
+	if (c == '0') { goto num_frac_or_exp; }
+	if (c == '-') { goto num_int_first_digit; }
+	p--;
+	goto done_invalid;
 
-		switch (c) {
-		case '0':
-			if (state == NUM_STATE_START || state == NUM_STATE_INT_FIRST_DIGIT) {
-				/*
-				 * If the very first digit is 0,
-				 *  it must be the last digit of the integer part
-				 *  (no leading zeroes allowed).
-				 */
-				state = NUM_STATE_FRAC_OR_EXP;
-				break;
-			}
-		/* fallthrough */
-		case '1':
-		case '2':
-		case '3':
-		case '4':
-		case '5':
-		case '6':
-		case '7':
-		case '8':
-		case '9':
-			switch (state) {
-			case NUM_STATE_START:
-			case NUM_STATE_INT_FIRST_DIGIT:
-				state = NUM_STATE_INT_DIGITS;
-				break;
-
-			case NUM_STATE_FRAC_FIRST_DIGIT:
-				state = NUM_STATE_FRAC_DIGITS;
-				break;
-
-			case NUM_STATE_EXP_SIGN:
-			case NUM_STATE_EXP_FIRST_DIGIT:
-				state = NUM_STATE_EXP_DIGITS;
-				break;
-
-			case NUM_STATE_INT_DIGITS:
-			case NUM_STATE_FRAC_DIGITS:
-			case NUM_STATE_EXP_DIGITS:
-				/* stay in same state */
-				break;
-
-			default:
-				return SPDK_JSON_PARSE_INVALID;
-			}
-			break;
-
-		case '.':
-			if (state != NUM_STATE_INT_DIGITS && state != NUM_STATE_FRAC_OR_EXP) {
-				return SPDK_JSON_PARSE_INVALID;
-			}
-			state = NUM_STATE_FRAC_FIRST_DIGIT;
-			break;
-
-		case 'e':
-		case 'E':
-			switch (state) {
-			case NUM_STATE_INT_DIGITS:
-			case NUM_STATE_FRAC_OR_EXP:
-			case NUM_STATE_FRAC_DIGITS:
-				state = NUM_STATE_EXP_SIGN;
-				break;
-			default:
-				return SPDK_JSON_PARSE_INVALID;
-			}
-			break;
-
-		case '-':
-			if (state == NUM_STATE_START) {
-				state = NUM_STATE_INT_FIRST_DIGIT;
-				break;
-			}
-		/* fallthrough */
-		case '+':
-			if (state == NUM_STATE_EXP_SIGN) {
-				state = NUM_STATE_EXP_FIRST_DIGIT;
-			} else {
-				return SPDK_JSON_PARSE_INVALID;
-			}
-			break;
-		default:
-			/*
-			 * Got an unexpected character - back up and stop parsing number.
-			 * The top-level parsing code will handle invalid trailing characters.
-			 */
-			p--;
-			goto done;
-		}
+num_int_first_digit:
+	if (spdk_likely(p != buf_end)) {
+		c = *p++;
+		if (c == '0') { goto num_frac_or_exp; }
+		if (c >= '1' && c <= '9') { goto num_int_digits; }
+		p--;
 	}
+	goto done_invalid;
 
-done:
-	switch (state) {
-	case NUM_STATE_INT_DIGITS:
-	case NUM_STATE_FRAC_OR_EXP:
-	case NUM_STATE_FRAC_DIGITS:
-	case NUM_STATE_EXP_DIGITS:
-		/* Valid end state */
-		return p - start;
+num_int_digits:
+	if (spdk_likely(p != buf_end)) {
+		c = *p++;
+		if (c >= '0' && c <= '9') { goto num_int_digits; }
+		if (c == '.') { goto num_frac_first_digit; }
+		if (c == 'e' || c == 'E') { goto num_exp_sign; }
+		p--;
+	}
+	goto done_valid;
 
-	default:
+num_frac_or_exp:
+	if (spdk_likely(p != buf_end)) {
+		c = *p++;
+		if (c == '.') { goto num_frac_first_digit; }
+		if (c == 'e' || c == 'E') { goto num_exp_sign; }
+		p--;
+	}
+	goto done_valid;
+
+num_frac_first_digit:
+	if (spdk_likely(p != buf_end)) {
+		c = *p++;
+		if (c >= '0' && c <= '9') { goto num_frac_digits; }
+		p--;
+	}
+	goto done_invalid;
+
+num_frac_digits:
+	if (spdk_likely(p != buf_end)) {
+		c = *p++;
+		if (c >= '0' && c <= '9') { goto num_frac_digits; }
+		if (c == 'e' || c == 'E') { goto num_exp_sign; }
+		p--;
+	}
+	goto done_valid;
+
+num_exp_sign:
+	if (spdk_likely(p != buf_end)) {
+		c = *p++;
+		if (c >= '0' && c <= '9') { goto num_exp_digits; }
+		if (c == '-' || c == '+') { goto num_exp_first_digit; }
+		p--;
+	}
+	goto done_invalid;
+
+num_exp_first_digit:
+	if (spdk_likely(p != buf_end)) {
+		c = *p++;
+		if (c >= '0' && c <= '9') { goto num_exp_digits; }
+		p--;
+	}
+	goto done_invalid;
+
+num_exp_digits:
+	if (spdk_likely(p != buf_end)) {
+		c = *p++;
+		if (c >= '0' && c <= '9') { goto num_exp_digits; }
+		p--;
+	}
+	goto done_valid;
+
+done_valid:
+	/* Valid end state */
+	return p - start;
+
+done_invalid:
+	/* Invalid end state */
+	if (p == buf_end) {
+		/* Hit the end of the buffer - the stream is incomplete. */
 		return SPDK_JSON_PARSE_INCOMPLETE;
 	}
+
+	/* Found an invalid character in an invalid end state */
+	return SPDK_JSON_PARSE_INVALID;
 }
 
 static int
@@ -467,7 +453,7 @@ spdk_json_parse(void *json, size_t size, struct spdk_json_val *values, size_t nu
 	size_t con_start_value;
 	uint8_t *data = json;
 	uint8_t *new_data;
-	int rc;
+	int rc = 0;
 	const struct json_literal *lit;
 	enum {
 		STATE_VALUE, /* initial state */
@@ -501,11 +487,11 @@ spdk_json_parse(void *json, size_t size, struct spdk_json_val *values, size_t nu
 		case 'f':
 		case 'n':
 			/* true, false, or null */
-			if (state != STATE_VALUE) return SPDK_JSON_PARSE_INVALID;
+			if (state != STATE_VALUE) { goto done_invalid; }
 			lit = &g_json_literals[(c >> 3) & 3]; /* See comment above g_json_literals[] */
 			assert(lit->str[0] == c);
 			rc = match_literal(data, json_end, lit->str, lit->len);
-			if (rc < 0) return rc;
+			if (rc < 0) { goto done_rc; }
 			ADD_VALUE(lit->type, data, data + rc);
 			data += rc;
 			state = depth ? STATE_VALUE_SEPARATOR : STATE_END;
@@ -513,9 +499,12 @@ spdk_json_parse(void *json, size_t size, struct spdk_json_val *values, size_t nu
 			break;
 
 		case '"':
-			if (state != STATE_VALUE && state != STATE_NAME) return SPDK_JSON_PARSE_INVALID;
+			if (state != STATE_VALUE && state != STATE_NAME) { goto done_invalid; }
 			rc = json_decode_string(data, json_end, &new_data, flags);
-			if (rc < 0) return rc;
+			if (rc < 0) {
+				data = new_data;
+				goto done_rc;
+			}
 			/*
 			 * Start is data + 1 to skip initial quote.
 			 * Length is data + rc - 1 to skip both quotes.
@@ -542,9 +531,9 @@ spdk_json_parse(void *json, size_t size, struct spdk_json_val *values, size_t nu
 		case '7':
 		case '8':
 		case '9':
-			if (state != STATE_VALUE) return SPDK_JSON_PARSE_INVALID;
+			if (state != STATE_VALUE) { goto done_invalid; }
 			rc = json_valid_number(data, json_end);
-			if (rc < 0) return rc;
+			if (rc < 0) { goto done_rc; }
 			ADD_VALUE(SPDK_JSON_VAL_NUMBER, data, data + rc);
 			data += rc;
 			state = depth ? STATE_VALUE_SEPARATOR : STATE_END;
@@ -553,9 +542,10 @@ spdk_json_parse(void *json, size_t size, struct spdk_json_val *values, size_t nu
 
 		case '{':
 		case '[':
-			if (state != STATE_VALUE) return SPDK_JSON_PARSE_INVALID;
+			if (state != STATE_VALUE) { goto done_invalid; }
 			if (depth == SPDK_JSON_MAX_NESTING_DEPTH) {
-				return SPDK_JSON_PARSE_MAX_DEPTH_EXCEEDED;
+				rc = SPDK_JSON_PARSE_MAX_DEPTH_EXCEEDED;
+				goto done_rc;
 			}
 			if (c == '{') {
 				con_type = SPDK_JSON_VAL_OBJECT_BEGIN;
@@ -573,8 +563,8 @@ spdk_json_parse(void *json, size_t size, struct spdk_json_val *values, size_t nu
 
 		case '}':
 		case ']':
-			if (trailing_comma) return SPDK_JSON_PARSE_INVALID;
-			if (depth == 0) return SPDK_JSON_PARSE_INVALID;
+			if (trailing_comma) { goto done_invalid; }
+			if (depth == 0) { goto done_invalid; }
 			con_type = containers[--depth];
 			con_start_value = con_value[depth];
 			if (values && con_start_value < num_values) {
@@ -582,18 +572,18 @@ spdk_json_parse(void *json, size_t size, struct spdk_json_val *values, size_t nu
 			}
 			if (c == '}') {
 				if (state != STATE_NAME && state != STATE_VALUE_SEPARATOR) {
-					return SPDK_JSON_PARSE_INVALID;
+					goto done_invalid;
 				}
 				if (con_type != SPDK_JSON_VAL_OBJECT_BEGIN) {
-					return SPDK_JSON_PARSE_INVALID;
+					goto done_invalid;
 				}
 				ADD_VALUE(SPDK_JSON_VAL_OBJECT_END, data, data + 1);
 			} else {
 				if (state != STATE_VALUE && state != STATE_VALUE_SEPARATOR) {
-					return SPDK_JSON_PARSE_INVALID;
+					goto done_invalid;
 				}
 				if (con_type != SPDK_JSON_VAL_ARRAY_BEGIN) {
-					return SPDK_JSON_PARSE_INVALID;
+					goto done_invalid;
 				}
 				ADD_VALUE(SPDK_JSON_VAL_ARRAY_END, data, data + 1);
 			}
@@ -604,7 +594,7 @@ spdk_json_parse(void *json, size_t size, struct spdk_json_val *values, size_t nu
 			break;
 
 		case ',':
-			if (state != STATE_VALUE_SEPARATOR) return SPDK_JSON_PARSE_INVALID;
+			if (state != STATE_VALUE_SEPARATOR) { goto done_invalid; }
 			data++;
 			assert(con_type == SPDK_JSON_VAL_ARRAY_BEGIN ||
 			       con_type == SPDK_JSON_VAL_OBJECT_BEGIN);
@@ -613,23 +603,23 @@ spdk_json_parse(void *json, size_t size, struct spdk_json_val *values, size_t nu
 			break;
 
 		case ':':
-			if (state != STATE_NAME_SEPARATOR) return SPDK_JSON_PARSE_INVALID;
+			if (state != STATE_NAME_SEPARATOR) { goto done_invalid; }
 			data++;
 			state = STATE_VALUE;
 			break;
 
 		case '/':
 			if (!(flags & SPDK_JSON_PARSE_FLAG_ALLOW_COMMENTS)) {
-				return SPDK_JSON_PARSE_INVALID;
+				goto done_invalid;
 			}
 			rc = json_valid_comment(data, json_end);
-			if (rc < 0) return rc;
+			if (rc < 0) { goto done_rc; }
 			/* Skip over comment */
 			data += rc;
 			break;
 
 		default:
-			return SPDK_JSON_PARSE_INVALID;
+			goto done_invalid;
 		}
 
 		if (state == STATE_END) {
@@ -663,8 +653,16 @@ spdk_json_parse(void *json, size_t size, struct spdk_json_val *values, size_t nu
 	}
 
 	/* Invalid end state - ran out of data */
+	rc = SPDK_JSON_PARSE_INCOMPLETE;
+
+done_rc:
+	assert(rc < 0);
 	if (end) {
 		*end = data;
 	}
-	return SPDK_JSON_PARSE_INCOMPLETE;
+	return rc;
+
+done_invalid:
+	rc = SPDK_JSON_PARSE_INVALID;
+	goto done_rc;
 }

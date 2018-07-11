@@ -31,86 +31,57 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-/** \file
-* Event framework public API.
-*
-* This is a framework for writing asynchronous, polled-mode, shared-nothing
-* server applications. The framework relies on DPDK for much of its underlying
-* architecture. The framework defines several concepts - reactors, events, pollers,
-* and subsystems - that are described in the following sections.
-*
-* The framework runs one thread per core (the user provides a core mask), where
-* each thread is a tight loop. The threads never block for any reason. These threads
-* are called reactors and their main responsibility is to process incoming events
-* from a queue.
-*
-* An event, defined by \ref spdk_event is a bundled function pointer and arguments that
-* can be sent to a different core and executed. The function pointer is executed only once,
-* and then the entire event is freed. These functions should never block and preferably
-* should execute very quickly. Events also have a pointer to a 'next' event that will be
-* executed upon completion of the given event, which allows chaining. This is
-* very much a simplified version of futures, promises, and continuations designed within
-* the constraints of the C programming language.
-*
-* The framework also defines another type of function called a poller. Pollers are also
-* functions with arguments that can be bundled and sent to a different core to be executed,
-* but they are instead executed repeatedly on that core until unregistered. The reactor
-* will handle interspersing calls to the pollers with other event processing automatically.
-* Pollers are intended to poll hardware as a replacement for interrupts and they should not
-* generally be used for any other purpose.
-*
-* The framework also defines an interface for subsystems, which are libraries of code that
-* depend on this framework. A library can register itself as a subsystem and provide
-* pointers to initialize and destroy itself which will be called at the appropriate time.
-* This is purely for sequencing initialization code in a convenient manner within the
-* framework.
-*
-* The framework itself is bundled into a higher level abstraction called an "app". Once
-* \ref spdk_app_start is called it will block the current thread until the application
-* terminates (by calling \ref spdk_app_stop).
-*/
+/**
+ * \file
+ * Event framework public API.
+ *
+ * See @ref event_components for an overview of the SPDK event framework API.
+ */
 
 #ifndef SPDK_EVENT_H
 #define SPDK_EVENT_H
 
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
+#include "spdk/stdinc.h"
 
+#include "spdk/cpuset.h"
 #include "spdk/queue.h"
+#include "spdk/log.h"
 
-#define SPDK_APP_DEFAULT_LOG_FACILITY	"local7"
-#define SPDK_APP_DEFAULT_LOG_PRIORITY	"info"
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-typedef struct spdk_event *spdk_event_t;
-typedef void (*spdk_event_fn)(spdk_event_t);
+/**
+ * Event handler function.
+ *
+ * \param arg1 Argument 1.
+ * \param arg2 Argument 2.
+ */
+typedef void (*spdk_event_fn)(void *arg1, void *arg2);
 
 /**
  * \brief An event is a function that is passed to and called on an lcore.
  */
-struct spdk_event {
-	uint32_t		lcore;
-	spdk_event_fn		fn;
-	void			*arg1;
-	void			*arg2;
-	struct spdk_event	*next;
-};
-
-typedef void (*spdk_poller_fn)(void *arg);
+struct spdk_event;
 
 /**
  * \brief A poller is a function that is repeatedly called on an lcore.
  */
 struct spdk_poller;
 
+/**
+ * Callback function for customized shutdown handling of application.
+ */
 typedef void (*spdk_app_shutdown_cb)(void);
-typedef void (*spdk_sighandler_t)(int);
 
-#define SPDK_APP_DPDK_DEFAULT_MEM_SIZE		2048
-#define SPDK_APP_DPDK_DEFAULT_MASTER_CORE	0
-#define SPDK_APP_DPDK_DEFAULT_MEM_CHANNEL	4
-#define SPDK_APP_DPDK_DEFAULT_CORE_MASK		"0x1"
+/**
+ * Signal handler fucntion.
+ *
+ * \param signal Signal number.
+ */
+typedef void (*spdk_sighandler_t)(int signal);
+
+#define SPDK_DEFAULT_RPC_ADDR "/var/tmp/spdk.sock"
 
 /**
  * \brief Event framework initialization options
@@ -118,19 +89,25 @@ typedef void (*spdk_sighandler_t)(int);
 struct spdk_app_opts {
 	const char *name;
 	const char *config_file;
+	const char *rpc_addr; /* Can be UNIX domain socket path or IP address + TCP port */
 	const char *reactor_mask;
-	const char *log_facility;
 	const char *tpoint_group_mask;
 
-	int instance_id;
+	int shm_id;
 
 	spdk_app_shutdown_cb	shutdown_cb;
 	spdk_sighandler_t	usr1_handler;
 
 	bool			enable_coredump;
-	uint32_t		dpdk_mem_channel;
-	uint32_t 		dpdk_master_core;
-	int			dpdk_mem_size;
+	int			mem_channel;
+	int			master_core;
+	int			mem_size;
+	bool			no_pci;
+	bool			hugepage_single_segments;
+	enum spdk_log_level	print_level;
+	size_t			num_pci_addr;
+	struct spdk_pci_addr	*pci_blacklist;
+	struct spdk_pci_addr	*pci_whitelist;
 
 	/* The maximum latency allowed when passing an event
 	 * from one core to another. A value of 0
@@ -138,159 +115,185 @@ struct spdk_app_opts {
 	 * specified in microseconds.
 	 */
 	uint64_t		max_delay_us;
+
+	/* Wait for the associated RPC before initializing subsystems
+	 * when this flag is enabled.
+	 */
+	bool			delay_subsystem_init;
+};
+
+struct spdk_reactor_tsc_stats {
+	uint64_t busy_tsc;
+	uint64_t idle_tsc;
+	uint64_t unknown_tsc;
 };
 
 /**
- * \brief Initialize the default value of opts
-*/
+ * Initialize the default value of opts
+ *
+ * \param opts Data structure where SPDK will initialize the default options.
+ */
 void spdk_app_opts_init(struct spdk_app_opts *opts);
 
 /**
- * \brief Initialize DPDK via opts.
-*/
-void spdk_dpdk_framework_init(struct spdk_app_opts *opts);
+ * Start the framework.
+ *
+ * Before calling this function, the fields of opts must be initialized by
+ * spdk_app_opts_init(). Once started, the framework will call start_fn on the
+ * master core with the arguments provided. This call will block until spdk_app_stop()
+ * is called, or if an error condition occurs during the intialization
+ * code within spdk_app_start(), itself, before invoking the caller's
+ * supplied function.
+ *
+ * \param opts Initialization options used for this application.
+ * \param start_fn Event function that is called when the framework starts.
+ * \param arg1 Argument passed to function start_fn.
+ * \param arg2 Argument passed to function start_fn.
+ *
+ * \return 0 on success or non-zero on failure.
+ */
+int spdk_app_start(struct spdk_app_opts *opts, spdk_event_fn start_fn,
+		   void *arg1, void *arg2);
 
 /**
- * \brief Initialize an application to use the event framework. This must be called prior to using
- * any other functions in this library.
-*/
-void spdk_app_init(struct spdk_app_opts *opts);
+ * Perform final shutdown operations on an application using the event framework.
+ */
+void spdk_app_fini(void);
 
 /**
- * \brief Perform final shutdown operations on an application using the event framework.
-*/
-int spdk_app_fini(void);
-
-/**
- * \brief Start the framework. Once started, the framework will call start_fn on the master
- * core with the arguments provided. This call will block until \ref spdk_app_stop is called.
-*/
-int spdk_app_start(spdk_event_fn start_fn, void *arg1, void *arg2);
-
-/**
- * \brief Start shutting down the framework.  Typically this function is not called directly, and
- * the shutdown process is started implicitly by a process signal.  But in applications that are
- * using SPDK for a subset of its process threads, this function can be called in lieu of a signal.
+ * Start shutting down the framework.
+ *
+ * Typically this function is not called directly, and the shutdown process is
+ * started implicitly by a process signal. But in applications that are using
+ * SPDK for a subset of its process threads, this function can be called in lieu
+ * of a signal.
  */
 void spdk_app_start_shutdown(void);
 
 /**
- * \brief Stop the framework. This does not wait for all threads to exit. Instead, it kicks off
- * the shutdown process and returns. Once the shutdown process is complete, \ref spdk_app_start will return.
-*/
+ * Stop the framework.
+ *
+ * This does not wait for all threads to exit. Instead, it kicks off the shutdown
+ * process and returns. Once the shutdown process is complete, spdk_app_start()
+ * will return.
+ *
+ * \param rc The rc value specified here will be returned to caller of spdk_app_start().
+ */
 void spdk_app_stop(int rc);
 
 /**
- * \brief Generate a configuration file that corresponds to the current running state.
-*/
+ * Generate a configuration file that corresponds to the current running state.
+ *
+ * \param config_str Values obtained from the generated configuration file.
+ * \param name Prefix for name of temporary configuration file to save the current config.
+ *
+ * \return 0 on success, -1 on failure.
+ */
 int spdk_app_get_running_config(char **config_str, char *name);
 
 /**
- * \brief Return the instance id for this application.
-*/
-int spdk_app_get_instance_id(void);
+ * Return the shared memory id for this application.
+ *
+ * \return shared memory id.
+ */
+int spdk_app_get_shm_id(void);
 
 /**
- * \brief Convert a string containing a CPU core mask into a bitmask
+ * Convert a string containing a CPU core mask into a bitmask
+ *
+ * \param mask String containing a CPU core mask.
+ * \param cpumask Bitmask of CPU cores.
+ *
+ * \return 0 on success, -1 on failure.
  */
-int spdk_app_parse_core_mask(const char *mask, uint64_t *cpumask);
+int spdk_app_parse_core_mask(const char *mask, struct spdk_cpuset *cpumask);
 
 /**
- * \brief Return a mask of the CPU cores active for this application
+ * Get the mask of the CPU cores active for this application
+ *
+ * \return the bitmask of the active CPU cores.
  */
-uint64_t spdk_app_get_core_mask(void);
+struct spdk_cpuset *spdk_app_get_core_mask(void);
 
-/**
- * \brief Return the number of CPU cores utilized by this application
- */
-int spdk_app_get_core_count(void);
+#define SPDK_APP_GETOPT_STRING "c:de:ghi:m:n:p:qr:s:uwB:L:W:"
 
-/**
- * \brief Return the lcore of the current thread.
- */
-uint32_t spdk_app_get_current_core(void);
-
-/**
- * \brief Allocate an event to be passed to \ref spdk_event_call
- */
-spdk_event_t spdk_event_allocate(uint32_t lcore, spdk_event_fn fn,
-				 void *arg1, void *arg2,
-				 spdk_event_t next);
-
-/**
- * \brief Pass the given event to the associated lcore and call the function.
- */
-void spdk_event_call(spdk_event_t event);
-
-#define spdk_event_get_next(event)	(event)->next
-#define spdk_event_get_arg1(event)	(event)->arg1
-#define spdk_event_get_arg2(event)	(event)->arg2
-
-/* TODO: This is only used by tests and should be made private */
-uint32_t spdk_event_queue_run_batch(uint32_t lcore);
-
-/**
- * \brief Register a poller on the given lcore.
- */
-void spdk_poller_register(struct spdk_poller **ppoller,
-			  spdk_poller_fn fn,
-			  void *arg,
-			  uint32_t lcore,
-			  struct spdk_event *complete,
-			  uint64_t period_microseconds);
-
-/**
- * \brief Unregister a poller on the given lcore.
- */
-void spdk_poller_unregister(struct spdk_poller **ppoller,
-			    struct spdk_event *complete);
-
-struct spdk_subsystem {
-	const char *name;
-	int (*init)(void);
-	int (*fini)(void);
-	void (*config)(FILE *fp);
-	TAILQ_ENTRY(spdk_subsystem) tailq;
+enum spdk_app_parse_args_rvals {
+	SPDK_APP_PARSE_ARGS_HELP = 0,
+	SPDK_APP_PARSE_ARGS_SUCCESS = 1,
+	SPDK_APP_PARSE_ARGS_FAIL = 2
 };
-
-struct spdk_subsystem_depend {
-	const char *name;
-	const char *depends_on;
-	struct spdk_subsystem *depends_on_subsystem;
-	TAILQ_ENTRY(spdk_subsystem_depend) tailq;
-};
-
-void spdk_add_subsystem(struct spdk_subsystem *subsystem);
-void spdk_add_subsystem_depend(struct spdk_subsystem_depend *depend);
+typedef enum spdk_app_parse_args_rvals spdk_app_parse_args_rvals_t;
 
 /**
- * \brief Register a new subsystem
+ * Helper function for parsing arguments and printing usage messages.
+ *
+ * \param argc Count of arguments in argv parameter array.
+ * \param argv Array of command line arguments.
+ * \param opts Default options for the application.
+ * \param getopt_str String representing the app-specific command line parameters.
+ * Characters in this string must not conflict with characters in SPDK_APP_GETOPT_STRING.
+ * \param parse Function pointer to call if an argument in getopt_str is found.
+ * \param usage Function pointer to print usage messages for app-specific command
+ *		line parameters.
+ *\return SPDK_APP_PARSE_ARGS_FAIL on failure, SPDK_APP_PARSE_ARGS_SUCCESS on
+ *        success, SPDK_APP_PARSE_ARGS_HELP if '-h' passed as an option.
  */
-#define SPDK_SUBSYSTEM_REGISTER(_name, _init, _fini, _config)			\
-	struct spdk_subsystem __spdk_subsystem_ ## _name = {			\
-	.name = #_name,								\
-	.init = _init,								\
-	.fini = _fini,								\
-	.config = _config,							\
-	};									\
-	__attribute__((constructor)) static void _name ## _register(void)	\
-	{									\
-		spdk_add_subsystem(&__spdk_subsystem_ ## _name);		\
-	}
+spdk_app_parse_args_rvals_t spdk_app_parse_args(int argc, char **argv,
+		struct spdk_app_opts *opts, const char *getopt_str,
+		void (*parse)(int ch, char *arg), void (*usage)(void));
 
 /**
- * \brief Declare that a subsystem depends on another subsystem.
+ * Print usage strings for common SPDK command line options.
+ *
+ * May only be called after spdk_app_parse_args().
  */
-#define SPDK_SUBSYSTEM_DEPEND(_name, _depends_on)						\
-	extern struct spdk_subsystem __spdk_subsystem_ ## _depends_on;				\
-	static struct spdk_subsystem_depend __subsystem_ ## _name ## _depend_on ## _depends_on = { \
-	.name = #_name,										\
-	.depends_on = #_depends_on,								\
-	.depends_on_subsystem = &__spdk_subsystem_ ## _depends_on,				\
-	};											\
-	__attribute__((constructor)) static void _name ## _depend_on ## _depends_on(void)	\
-	{											\
-		spdk_add_subsystem_depend(&__subsystem_ ## _name ## _depend_on ## _depends_on); \
-	}
+void spdk_app_usage(void);
+
+/**
+ * Allocate an event to be passed to spdk_event_call().
+ *
+ * \param lcore Lcore to run this event.
+ * \param fn Function used to execute event.
+ * \param arg1 Argument passed to function fn.
+ * \param arg2 Argument passed to function fn.
+ *
+ * \return a pointer to the allocated event.
+ */
+struct spdk_event *spdk_event_allocate(uint32_t lcore, spdk_event_fn fn,
+				       void *arg1, void *arg2);
+
+/**
+ * Pass the given event to the associated lcore and call the function.
+ *
+ * \param event Event to execute.
+ */
+void spdk_event_call(struct spdk_event *event);
+
+/**
+ * Enable or disable monitoring of context switches.
+ *
+ * \param enabled True to enable, false to disable.
+ */
+void spdk_reactor_enable_context_switch_monitor(bool enabled);
+
+/**
+ * Return whether context switch monitoring is enabled.
+ *
+ * \return true if enabled or false otherwise.
+ */
+bool spdk_reactor_context_switch_monitor_enabled(void);
+
+/**
+ * Get tsc stats from a given reactor
+ * Copy cumulative reactor tsc values to user's tsc_stats structure.
+ *
+ * \param tsc_stats User's tsc_stats structure.
+ * \param core_id Get tsc data on this Reactor core id.
+ */
+int spdk_reactor_get_tsc_stats(struct spdk_reactor_tsc_stats *tsc_stats, uint32_t core_id);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

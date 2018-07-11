@@ -34,14 +34,21 @@
 SPDK_ROOT_DIR := $(abspath $(CURDIR)/../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
-CFLAGS += $(ENV_CFLAGS) -I.
-C_SRCS = bdev.c
+ifeq ($(CONFIG_VTUNE),y)
+CFLAGS += -I$(VTUNE_SOURCE_DIR)/include -I$(VTUNE_SOURCE_DIR)/sdk/src/ittnotify
+endif
+
+C_SRCS = bdev.c part.c scsi_nvme.c
+C_SRCS-$(CONFIG_VTUNE) += vtune.c
 LIBNAME = bdev
 
-DIRS-y += malloc nvme rpc
+DIRS-y += error gpt lvol malloc null nvme passthru rpc split
 
 ifeq ($(OS),Linux)
 DIRS-y += aio
+DIRS-$(CONFIG_ISCSI_INITIATOR) += iscsi
+DIRS-$(CONFIG_VIRTIO) += virtio
+DIRS-$(CONFIG_PMDK) += pmem
 endif
 
 DIRS-$(CONFIG_RBD) += rbd
