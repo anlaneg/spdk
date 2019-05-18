@@ -786,6 +786,7 @@ bdev_virtio_poll(void *arg)
 	uint16_t i, cnt;
 	int rc;
 
+	//virtio报文收取
 	cnt = virtio_recv_pkts(ch->vq, (void **)io, io_len, SPDK_COUNTOF(io));
 	for (i = 0; i < cnt; ++i) {
 		if (spdk_unlikely(scan_ctx && io[i] == &scan_ctx->io_ctx)) {

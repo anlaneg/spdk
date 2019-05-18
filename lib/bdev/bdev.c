@@ -286,6 +286,7 @@ spdk_bdev_set_opts(struct spdk_bdev_opts *opts)
 	return 0;
 }
 
+//取第一个bdev设备
 struct spdk_bdev *
 spdk_bdev_first(void)
 {
@@ -354,6 +355,7 @@ spdk_bdev_next_leaf(struct spdk_bdev *prev)
 	return bdev;
 }
 
+//通过块设备名称查找块设备
 struct spdk_bdev *
 spdk_bdev_get_by_name(const char *bdev_name)
 {
@@ -362,15 +364,18 @@ spdk_bdev_get_by_name(const char *bdev_name)
 
 	while (bdev != NULL) {
 		if (strcmp(bdev_name, bdev->name) == 0) {
+			//两个设备名称相等，返回对应的块设备
 			return bdev;
 		}
 
+		//比对此设备对应的别名
 		TAILQ_FOREACH(tmp, &bdev->aliases, tailq) {
 			if (strcmp(bdev_name, tmp->alias) == 0) {
 				return bdev;
 			}
 		}
 
+		//取下一个块设备
 		bdev = spdk_bdev_next(bdev);
 	}
 
@@ -2742,6 +2747,7 @@ spdk_bdev_init(struct spdk_bdev *bdev)
 		return -EINVAL;
 	}
 
+	//检查此块设备是否已存在
 	if (spdk_bdev_get_by_name(bdev->name)) {
 		SPDK_ERRLOG("Bdev name:%s already exists\n", bdev->name);
 		return -EEXIST;

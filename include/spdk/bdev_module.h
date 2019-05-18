@@ -223,6 +223,7 @@ struct spdk_bdev {
 	char *name;
 
 	/** Unique aliases for this block device. */
+	//此块设备的别名列表
 	TAILQ_HEAD(spdk_bdev_aliases_list, spdk_bdev_alias) aliases;
 
 	/** Unique product name for this kind of block device. */
