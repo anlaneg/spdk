@@ -53,22 +53,33 @@ log_test(void)
 	spdk_log_set_level(SPDK_LOG_DEBUG);
 	CU_ASSERT_EQUAL(spdk_log_get_level(), SPDK_LOG_DEBUG);
 
+	spdk_log_set_print_level(SPDK_LOG_ERROR);
+	CU_ASSERT_EQUAL(spdk_log_get_print_level(), SPDK_LOG_ERROR);
+	spdk_log_set_print_level(SPDK_LOG_WARN);
+	CU_ASSERT_EQUAL(spdk_log_get_print_level(), SPDK_LOG_WARN);
+	spdk_log_set_print_level(SPDK_LOG_NOTICE);
+	CU_ASSERT_EQUAL(spdk_log_get_print_level(), SPDK_LOG_NOTICE);
+	spdk_log_set_print_level(SPDK_LOG_INFO);
+	CU_ASSERT_EQUAL(spdk_log_get_print_level(), SPDK_LOG_INFO);
+	spdk_log_set_print_level(SPDK_LOG_DEBUG);
+	CU_ASSERT_EQUAL(spdk_log_get_print_level(), SPDK_LOG_DEBUG);
+
 #ifdef DEBUG
-	CU_ASSERT(spdk_log_get_trace_flag("log") == false);
+	CU_ASSERT(spdk_log_get_flag("log") == false);
 
-	spdk_log_set_trace_flag("log");
-	CU_ASSERT(spdk_log_get_trace_flag("log") == true);
+	spdk_log_set_flag("log");
+	CU_ASSERT(spdk_log_get_flag("log") == true);
 
-	spdk_log_clear_trace_flag("log");
-	CU_ASSERT(spdk_log_get_trace_flag("log") == false);
+	spdk_log_clear_flag("log");
+	CU_ASSERT(spdk_log_get_flag("log") == false);
 #endif
 
-	spdk_log_open();
-	spdk_log_set_trace_flag("log");
+	spdk_log_open(NULL);
+	spdk_log_set_flag("log");
 	SPDK_WARNLOG("log warning unit test\n");
-	SPDK_DEBUGLOG(SPDK_LOG_LOG, "log trace test\n");
-	SPDK_TRACEDUMP(SPDK_LOG_LOG, "log trace dump test:", "trace dump", 10);
-	spdk_trace_dump(stderr, "spdk dump test:", "spdk dump", 9);
+	SPDK_DEBUGLOG(SPDK_LOG_LOG, "log test\n");
+	SPDK_LOGDUMP(SPDK_LOG_LOG, "log dump test:", "log dump", 8);
+	spdk_log_dump(stderr, "spdk dump test:", "spdk dump", 9);
 
 	spdk_log_close();
 }

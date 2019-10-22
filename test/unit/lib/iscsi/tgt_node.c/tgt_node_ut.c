@@ -42,6 +42,7 @@
 #include "iscsi/tgt_node.c"
 #include "scsi/scsi_internal.h"
 #include "unit/lib/json_mock.c"
+#include "common/lib/test_env.c"
 
 struct spdk_iscsi_globals g_spdk_iscsi;
 
@@ -62,29 +63,19 @@ DEFINE_STUB(spdk_scsi_lun_get_id,
 	    (const struct spdk_scsi_lun *lun),
 	    0);
 
-bool
-spdk_sock_is_ipv6(struct spdk_sock *sock)
-{
-	return false;
-}
+DEFINE_STUB_V(spdk_iscsi_op_abort_task_set,
+	      (struct spdk_iscsi_task *task,
+	       uint8_t function));
 
-bool
-spdk_sock_is_ipv4(struct spdk_sock *sock)
-{
-	return false;
-}
+DEFINE_STUB(spdk_sock_is_ipv6, bool, (struct spdk_sock *sock), false);
 
-struct spdk_iscsi_portal_grp *
-spdk_iscsi_portal_grp_find_by_tag(int tag)
-{
-	return NULL;
-}
+DEFINE_STUB(spdk_sock_is_ipv4, bool, (struct spdk_sock *sock), false);
 
-struct spdk_iscsi_init_grp *
-spdk_iscsi_init_grp_find_by_tag(int tag)
-{
-	return NULL;
-}
+DEFINE_STUB(spdk_iscsi_portal_grp_find_by_tag,
+	    struct spdk_iscsi_portal_grp *, (int tag), NULL);
+
+DEFINE_STUB(spdk_iscsi_init_grp_find_by_tag, struct spdk_iscsi_init_grp *,
+	    (int tag), NULL);
 
 struct spdk_scsi_lun *
 spdk_scsi_dev_get_lun(struct spdk_scsi_dev *dev, int lun_id)
@@ -180,7 +171,7 @@ config_file_fail_cases(void)
 		if (sp == NULL) {
 			break;
 		}
-		rc = spdk_iscsi_parse_tgt_node(sp);
+		rc = iscsi_parse_tgt_node(sp);
 		CU_ASSERT(rc < 0);
 		section_index++;
 	}
@@ -199,10 +190,10 @@ allow_any_allowed(void)
 	addr1 = "2001:ad6:1234:5678:9abc::";
 	addr2 = "192.168.2.1";
 
-	result = spdk_iscsi_netmask_allow_addr(netmask, addr1);
+	result = iscsi_netmask_allow_addr(netmask, addr1);
 	CU_ASSERT(result == true);
 
-	result = spdk_iscsi_netmask_allow_addr(netmask, addr2);
+	result = iscsi_netmask_allow_addr(netmask, addr2);
 	CU_ASSERT(result == true);
 }
 
@@ -216,16 +207,16 @@ allow_ipv6_allowed(void)
 	netmask = "[2001:ad6:1234::]/48";
 	addr = "2001:ad6:1234:5678:9abc::";
 
-	result = spdk_iscsi_ipv6_netmask_allow_addr(netmask, addr);
+	result = iscsi_ipv6_netmask_allow_addr(netmask, addr);
 	CU_ASSERT(result == true);
 
-	result = spdk_iscsi_netmask_allow_addr(netmask, addr);
+	result = iscsi_netmask_allow_addr(netmask, addr);
 	CU_ASSERT(result == true);
 
 	/* Netmask prefix bits == 128 (all bits must match) */
 	netmask = "[2001:ad6:1234:5678:9abc::1]/128";
 	addr = "2001:ad6:1234:5678:9abc::1";
-	result = spdk_iscsi_ipv6_netmask_allow_addr(netmask, addr);
+	result = iscsi_ipv6_netmask_allow_addr(netmask, addr);
 	CU_ASSERT(result == true);
 }
 
@@ -239,16 +230,16 @@ allow_ipv6_denied(void)
 	netmask = "[2001:ad6:1234::]/56";
 	addr = "2001:ad6:1234:5678:9abc::";
 
-	result = spdk_iscsi_ipv6_netmask_allow_addr(netmask, addr);
+	result = iscsi_ipv6_netmask_allow_addr(netmask, addr);
 	CU_ASSERT(result == false);
 
-	result = spdk_iscsi_netmask_allow_addr(netmask, addr);
+	result = iscsi_netmask_allow_addr(netmask, addr);
 	CU_ASSERT(result == false);
 
 	/* Netmask prefix bits == 128 (all bits must match) */
 	netmask = "[2001:ad6:1234:5678:9abc::1]/128";
 	addr = "2001:ad6:1234:5678:9abc::2";
-	result = spdk_iscsi_ipv6_netmask_allow_addr(netmask, addr);
+	result = iscsi_ipv6_netmask_allow_addr(netmask, addr);
 	CU_ASSERT(result == false);
 }
 
@@ -262,19 +253,19 @@ allow_ipv6_invalid(void)
 	/* Netmask prefix bits > 128 */
 	netmask = "[2001:ad6:1234::]/129";
 	addr = "2001:ad6:1234:5678:9abc::";
-	result = spdk_iscsi_ipv6_netmask_allow_addr(netmask, addr);
+	result = iscsi_ipv6_netmask_allow_addr(netmask, addr);
 	CU_ASSERT(result == false);
 
 	/* Netmask prefix bits == 0 */
 	netmask = "[2001:ad6:1234::]/0";
 	addr = "2001:ad6:1234:5678:9abc::";
-	result = spdk_iscsi_ipv6_netmask_allow_addr(netmask, addr);
+	result = iscsi_ipv6_netmask_allow_addr(netmask, addr);
 	CU_ASSERT(result == false);
 
 	/* Netmask prefix bits < 0 */
 	netmask = "[2001:ad6:1234::]/-1";
 	addr = "2001:ad6:1234:5678:9abc::";
-	result = spdk_iscsi_ipv6_netmask_allow_addr(netmask, addr);
+	result = iscsi_ipv6_netmask_allow_addr(netmask, addr);
 	CU_ASSERT(result == false);
 }
 
@@ -288,16 +279,16 @@ allow_ipv4_allowed(void)
 	netmask = "192.168.2.0/24";
 	addr = "192.168.2.1";
 
-	result = spdk_iscsi_ipv4_netmask_allow_addr(netmask, addr);
+	result = iscsi_ipv4_netmask_allow_addr(netmask, addr);
 	CU_ASSERT(result == true);
 
-	result = spdk_iscsi_netmask_allow_addr(netmask, addr);
+	result = iscsi_netmask_allow_addr(netmask, addr);
 	CU_ASSERT(result == true);
 
 	/* Netmask prefix == 32 (all bits must match) */
 	netmask = "192.168.2.1/32";
 	addr = "192.168.2.1";
-	result = spdk_iscsi_ipv4_netmask_allow_addr(netmask, addr);
+	result = iscsi_ipv4_netmask_allow_addr(netmask, addr);
 	CU_ASSERT(result == true);
 }
 
@@ -311,16 +302,16 @@ allow_ipv4_denied(void)
 	netmask = "192.168.2.0";
 	addr  = "192.168.2.1";
 
-	result = spdk_iscsi_ipv4_netmask_allow_addr(netmask, addr);
+	result = iscsi_ipv4_netmask_allow_addr(netmask, addr);
 	CU_ASSERT(result == false);
 
-	result = spdk_iscsi_netmask_allow_addr(netmask, addr);
+	result = iscsi_netmask_allow_addr(netmask, addr);
 	CU_ASSERT(result == false);
 
 	/* Netmask prefix == 32 (all bits must match) */
 	netmask = "192.168.2.1/32";
 	addr = "192.168.2.2";
-	result = spdk_iscsi_ipv4_netmask_allow_addr(netmask, addr);
+	result = iscsi_ipv4_netmask_allow_addr(netmask, addr);
 	CU_ASSERT(result == false);
 }
 
@@ -334,19 +325,19 @@ allow_ipv4_invalid(void)
 	/* Netmask prefix bits > 32 */
 	netmask = "192.168.2.0/33";
 	addr = "192.168.2.1";
-	result = spdk_iscsi_ipv4_netmask_allow_addr(netmask, addr);
+	result = iscsi_ipv4_netmask_allow_addr(netmask, addr);
 	CU_ASSERT(result == false);
 
 	/* Netmask prefix bits == 0 */
 	netmask = "192.168.2.0/0";
 	addr = "192.168.2.1";
-	result = spdk_iscsi_ipv4_netmask_allow_addr(netmask, addr);
+	result = iscsi_ipv4_netmask_allow_addr(netmask, addr);
 	CU_ASSERT(result == false);
 
 	/* Netmask prefix bits < 0 */
 	netmask = "192.168.2.0/-1";
 	addr = "192.168.2.1";
-	result = spdk_iscsi_ipv4_netmask_allow_addr(netmask, addr);
+	result = iscsi_ipv4_netmask_allow_addr(netmask, addr);
 	CU_ASSERT(result == false);
 }
 
@@ -374,32 +365,32 @@ node_access_allowed(void)
 	ig.tag = 1;
 
 	ig.ninitiators = 1;
-	iname.name = "iqn.2017-10.spdk.io:0001";
+	snprintf(iname.name, sizeof(iname.name), "iqn.2017-10.spdk.io:0001");
 	TAILQ_INIT(&ig.initiator_head);
 	TAILQ_INSERT_TAIL(&ig.initiator_head, &iname, tailq);
 
 	ig.nnetmasks = 1;
-	imask.mask = "192.168.2.0/24";
+	snprintf(imask.mask, sizeof(imask.mask), "192.168.2.0/24");
 	TAILQ_INIT(&ig.netmask_head);
 	TAILQ_INSERT_TAIL(&ig.netmask_head, &imask, tailq);
 
 	/* target initialization */
 	memset(&tgtnode, 0, sizeof(struct spdk_iscsi_tgt_node));
-	tgtnode.name = "iqn.2017-10.spdk.io:0001";
+	snprintf(tgtnode.name, sizeof(tgtnode.name), "iqn.2017-10.spdk.io:0001");
 	TAILQ_INIT(&tgtnode.pg_map_head);
 
 	memset(&scsi_dev, 0, sizeof(struct spdk_scsi_dev));
 	snprintf(scsi_dev.name, sizeof(scsi_dev.name), "iqn.2017-10.spdk.io:0001");
 	tgtnode.dev = &scsi_dev;
 
-	pg_map = spdk_iscsi_tgt_node_add_pg_map(&tgtnode, &pg);
-	spdk_iscsi_pg_map_add_ig_map(pg_map, &ig);
+	pg_map = iscsi_tgt_node_add_pg_map(&tgtnode, &pg);
+	iscsi_pg_map_add_ig_map(pg_map, &ig);
 
 	/* portal initialization */
 	memset(&portal, 0, sizeof(struct spdk_iscsi_portal));
 	portal.group = &pg;
-	portal.host = "192.168.2.0";
-	portal.port = "3260";
+	snprintf(portal.host, sizeof(portal.host), "192.168.2.0");
+	snprintf(portal.port, sizeof(portal.port), "3260");
 
 	/* input for UT */
 	memset(&conn, 0, sizeof(struct spdk_iscsi_conn));
@@ -411,8 +402,8 @@ node_access_allowed(void)
 	result = spdk_iscsi_tgt_node_access(&conn, &tgtnode, iqn, addr);
 	CU_ASSERT(result == true);
 
-	spdk_iscsi_pg_map_delete_ig_map(pg_map, &ig);
-	spdk_iscsi_tgt_node_delete_pg_map(&tgtnode, &pg);
+	iscsi_pg_map_delete_ig_map(pg_map, &ig);
+	iscsi_tgt_node_delete_pg_map(&tgtnode, &pg);
 }
 
 static void
@@ -438,7 +429,7 @@ node_access_denied_by_empty_netmask(void)
 	ig.tag = 1;
 
 	ig.ninitiators = 1;
-	iname.name = "iqn.2017-10.spdk.io:0001";
+	snprintf(iname.name, sizeof(iname.name), "iqn.2017-10.spdk.io:0001");
 	TAILQ_INIT(&ig.initiator_head);
 	TAILQ_INSERT_TAIL(&ig.initiator_head, &iname, tailq);
 
@@ -447,21 +438,21 @@ node_access_denied_by_empty_netmask(void)
 
 	/* target initialization */
 	memset(&tgtnode, 0, sizeof(struct spdk_iscsi_tgt_node));
-	tgtnode.name = "iqn.2017-10.spdk.io:0001";
+	snprintf(tgtnode.name, sizeof(tgtnode.name), "iqn.2017-10.spdk.io:0001");
 	TAILQ_INIT(&tgtnode.pg_map_head);
 
 	memset(&scsi_dev, 0, sizeof(struct spdk_scsi_dev));
 	snprintf(scsi_dev.name, sizeof(scsi_dev.name), "iqn.2017-10.spdk.io:0001");
 	tgtnode.dev = &scsi_dev;
 
-	pg_map = spdk_iscsi_tgt_node_add_pg_map(&tgtnode, &pg);
-	spdk_iscsi_pg_map_add_ig_map(pg_map, &ig);
+	pg_map = iscsi_tgt_node_add_pg_map(&tgtnode, &pg);
+	iscsi_pg_map_add_ig_map(pg_map, &ig);
 
 	/* portal initialization */
 	memset(&portal, 0, sizeof(struct spdk_iscsi_portal));
 	portal.group = &pg;
-	portal.host = "192.168.2.0";
-	portal.port = "3260";
+	snprintf(portal.host, sizeof(portal.host), "192.168.2.0");
+	snprintf(portal.port, sizeof(portal.port), "3260");
 
 	/* input for UT */
 	memset(&conn, 0, sizeof(struct spdk_iscsi_conn));
@@ -473,8 +464,8 @@ node_access_denied_by_empty_netmask(void)
 	result = spdk_iscsi_tgt_node_access(&conn, &tgtnode, iqn, addr);
 	CU_ASSERT(result == false);
 
-	spdk_iscsi_pg_map_delete_ig_map(pg_map, &ig);
-	spdk_iscsi_tgt_node_delete_pg_map(&tgtnode, &pg);
+	iscsi_pg_map_delete_ig_map(pg_map, &ig);
+	iscsi_tgt_node_delete_pg_map(&tgtnode, &pg);
 }
 
 #define IQN1	"iqn.2017-11.spdk.io:0001"
@@ -491,8 +482,8 @@ node_access_multi_initiator_groups_cases(void)
 	struct spdk_iscsi_portal_grp pg;
 	struct spdk_iscsi_portal portal;
 	struct spdk_iscsi_init_grp ig1, ig2;
-	struct spdk_iscsi_initiator_name iname1, iname2;
-	struct spdk_iscsi_initiator_netmask imask1, imask2;
+	struct spdk_iscsi_initiator_name iname1 = {}, iname2 = {};
+	struct spdk_iscsi_initiator_netmask imask1 = {}, imask2 = {};
 	struct spdk_scsi_dev scsi_dev;
 	struct spdk_iscsi_pg_map *pg_map;
 	char *iqn, *addr;
@@ -500,7 +491,7 @@ node_access_multi_initiator_groups_cases(void)
 
 	/* target initialization */
 	memset(&tgtnode, 0, sizeof(struct spdk_iscsi_tgt_node));
-	tgtnode.name = IQN1;
+	snprintf(tgtnode.name, sizeof(tgtnode.name), IQN1);
 	TAILQ_INIT(&tgtnode.pg_map_head);
 
 	memset(&scsi_dev, 0, sizeof(struct spdk_scsi_dev));
@@ -514,11 +505,9 @@ node_access_multi_initiator_groups_cases(void)
 	TAILQ_INIT(&ig1.netmask_head);
 
 	ig1.ninitiators = 1;
-	iname1.name = NULL;
 	TAILQ_INSERT_TAIL(&ig1.initiator_head, &iname1, tailq);
 
 	ig1.nnetmasks = 1;
-	imask1.mask = NULL;
 	TAILQ_INSERT_TAIL(&ig1.netmask_head, &imask1, tailq);
 
 	memset(&ig2, 0, sizeof(struct spdk_iscsi_init_grp));
@@ -527,26 +516,24 @@ node_access_multi_initiator_groups_cases(void)
 	TAILQ_INIT(&ig2.netmask_head);
 
 	ig2.ninitiators = 1;
-	iname2.name = NULL;
 	TAILQ_INSERT_TAIL(&ig2.initiator_head, &iname2, tailq);
 
 	ig2.nnetmasks = 1;
-	imask2.mask = NULL;
 	TAILQ_INSERT_TAIL(&ig2.netmask_head, &imask2, tailq);
 
 	/* portal group initialization */
 	memset(&pg, 0, sizeof(struct spdk_iscsi_portal_grp));
 	pg.tag = 1;
 
-	pg_map = spdk_iscsi_tgt_node_add_pg_map(&tgtnode, &pg);
-	spdk_iscsi_pg_map_add_ig_map(pg_map, &ig1);
-	spdk_iscsi_pg_map_add_ig_map(pg_map, &ig2);
+	pg_map = iscsi_tgt_node_add_pg_map(&tgtnode, &pg);
+	iscsi_pg_map_add_ig_map(pg_map, &ig1);
+	iscsi_pg_map_add_ig_map(pg_map, &ig2);
 
 	/* portal initialization */
 	memset(&portal, 0, sizeof(struct spdk_iscsi_portal));
 	portal.group = &pg;
-	portal.host = IP1;
-	portal.port = "3260";
+	snprintf(portal.host, sizeof(portal.host), IP1);
+	snprintf(portal.port, sizeof(portal.port), "3260");
 
 	/* connection initialization */
 	memset(&conn, 0, sizeof(struct spdk_iscsi_conn));
@@ -566,7 +553,7 @@ node_access_multi_initiator_groups_cases(void)
 	 * | denied    | -       | -         | -       | denied  |
 	 * +-------------------------------------------+---------+
 	 */
-	iname1.name = NO_IQN1;
+	snprintf(iname1.name, sizeof(iname1.name), NO_IQN1);
 
 	result = spdk_iscsi_tgt_node_access(&conn, &tgtnode, iqn, addr);
 	CU_ASSERT(result == false);
@@ -582,8 +569,8 @@ node_access_multi_initiator_groups_cases(void)
 	 * | allowed   | allowed | -         | -       | allowed |
 	 * +-------------------------------------------+---------+
 	 */
-	iname1.name = IQN1;
-	imask1.mask = IP1;
+	snprintf(iname1.name, sizeof(iname1.name), IQN1);
+	snprintf(imask1.mask, sizeof(imask1.mask), IP1);
 
 	result = spdk_iscsi_tgt_node_access(&conn, &tgtnode, iqn, addr);
 	CU_ASSERT(result == true);
@@ -599,9 +586,9 @@ node_access_multi_initiator_groups_cases(void)
 	 * | allowed   | denied  | denied   | -        | denied  |
 	 * +-------------------------------------------+---------+
 	 */
-	iname1.name = IQN1;
-	imask1.mask = IP2;
-	iname2.name = NO_IQN1;
+	snprintf(iname1.name, sizeof(iname1.name), IQN1);
+	snprintf(imask1.mask, sizeof(imask1.mask), IP2);
+	snprintf(iname2.name, sizeof(iname2.name), NO_IQN1);
 
 	result = spdk_iscsi_tgt_node_access(&conn, &tgtnode, iqn, addr);
 	CU_ASSERT(result == false);
@@ -617,10 +604,10 @@ node_access_multi_initiator_groups_cases(void)
 	 * | allowed   | denied  | allowed   | allowed | allowed |
 	 * +-------------------------------------------+---------+
 	 */
-	iname1.name = IQN1;
-	imask1.mask = IP2;
-	iname2.name = IQN1;
-	imask2.mask = IP1;
+	snprintf(iname1.name, sizeof(iname1.name), IQN1);
+	snprintf(imask1.mask, sizeof(imask1.mask), IP2);
+	snprintf(iname2.name, sizeof(iname2.name), IQN1);
+	snprintf(imask2.mask, sizeof(imask2.mask), IP1);
 
 	result = spdk_iscsi_tgt_node_access(&conn, &tgtnode, iqn, addr);
 	CU_ASSERT(result == true);
@@ -636,10 +623,10 @@ node_access_multi_initiator_groups_cases(void)
 	 * | allowed   | denied  | allowed     | denied  | denied  |
 	 * +---------------------------------------------+---------+
 	 */
-	iname1.name = IQN1;
-	imask1.mask = IP2;
-	iname2.name = IQN1;
-	imask2.mask = IP2;
+	snprintf(iname1.name, sizeof(iname1.name), IQN1);
+	snprintf(imask1.mask, sizeof(imask1.mask), IP2);
+	snprintf(iname2.name, sizeof(iname2.name), IQN1);
+	snprintf(imask2.mask, sizeof(imask2.mask), IP2);
 
 	result = spdk_iscsi_tgt_node_access(&conn, &tgtnode, iqn, addr);
 	CU_ASSERT(result == false);
@@ -655,9 +642,9 @@ node_access_multi_initiator_groups_cases(void)
 	 * | allowed   | denied  | not found   | -       | denied  |
 	 * +---------------------------------------------+---------+
 	 */
-	iname1.name = IQN1;
-	imask1.mask = IP2;
-	iname2.name = IQN2;
+	snprintf(iname1.name, sizeof(iname1.name), IQN1);
+	snprintf(imask1.mask, sizeof(imask1.mask), IP2);
+	snprintf(iname2.name, sizeof(iname2.name), IQN2);
 
 	result = spdk_iscsi_tgt_node_access(&conn, &tgtnode, iqn, addr);
 	CU_ASSERT(result == false);
@@ -673,8 +660,8 @@ node_access_multi_initiator_groups_cases(void)
 	 * | not found   | -       | denied    | -       | denied  |
 	 * +---------------------------------------------+---------+
 	 */
-	iname1.name = IQN2;
-	iname2.name = NO_IQN1;
+	snprintf(iname1.name, sizeof(iname1.name), IQN2);
+	snprintf(iname2.name, sizeof(iname2.name), NO_IQN1);
 
 	result = spdk_iscsi_tgt_node_access(&conn, &tgtnode, iqn, addr);
 	CU_ASSERT(result == false);
@@ -690,9 +677,9 @@ node_access_multi_initiator_groups_cases(void)
 	 * | not found   | -       | allowed   | allowed | allowed |
 	 * +---------------------------------------------+---------+
 	 */
-	iname1.name = IQN2;
-	iname2.name = IQN1;
-	imask2.mask = IP1;
+	snprintf(iname1.name, sizeof(iname1.name), IQN2);
+	snprintf(iname2.name, sizeof(iname2.name), IQN1);
+	snprintf(imask2.mask, sizeof(imask2.mask), IP1);
 
 	result = spdk_iscsi_tgt_node_access(&conn, &tgtnode, iqn, addr);
 	CU_ASSERT(result == true);
@@ -708,9 +695,9 @@ node_access_multi_initiator_groups_cases(void)
 	 * | not found   | -       | allowed   | denied  | denied  |
 	 * +---------------------------------------------+---------+
 	 */
-	iname1.name = IQN2;
-	iname2.name = IQN1;
-	imask2.mask = IP2;
+	snprintf(iname1.name, sizeof(iname1.name), IQN2);
+	snprintf(iname2.name, sizeof(iname2.name), IQN1);
+	snprintf(imask2.mask, sizeof(imask2.mask), IP2);
 
 	result = spdk_iscsi_tgt_node_access(&conn, &tgtnode, iqn, addr);
 	CU_ASSERT(result == false);
@@ -726,15 +713,15 @@ node_access_multi_initiator_groups_cases(void)
 	 * | not found   | -       | not found | -       | denied  |
 	 * +---------------------------------------------+---------+
 	 */
-	iname1.name = IQN2;
-	iname2.name = IQN2;
+	snprintf(iname1.name, sizeof(iname1.name), IQN2);
+	snprintf(iname2.name, sizeof(iname2.name), IQN2);
 
 	result = spdk_iscsi_tgt_node_access(&conn, &tgtnode, iqn, addr);
 	CU_ASSERT(result == false);
 
-	spdk_iscsi_pg_map_delete_ig_map(pg_map, &ig1);
-	spdk_iscsi_pg_map_delete_ig_map(pg_map, &ig2);
-	spdk_iscsi_tgt_node_delete_pg_map(&tgtnode, &pg);
+	iscsi_pg_map_delete_ig_map(pg_map, &ig1);
+	iscsi_pg_map_delete_ig_map(pg_map, &ig2);
+	iscsi_tgt_node_delete_pg_map(&tgtnode, &pg);
 }
 
 static void
@@ -743,7 +730,7 @@ allow_iscsi_name_multi_maps_case(void)
 	struct spdk_iscsi_tgt_node tgtnode;
 	struct spdk_iscsi_portal_grp pg1, pg2;
 	struct spdk_iscsi_init_grp ig;
-	struct spdk_iscsi_initiator_name iname;
+	struct spdk_iscsi_initiator_name iname = {};
 	struct spdk_iscsi_pg_map *pg_map1, *pg_map2;
 	struct spdk_scsi_dev scsi_dev;
 	char *iqn;
@@ -762,7 +749,6 @@ allow_iscsi_name_multi_maps_case(void)
 	TAILQ_INIT(&ig.initiator_head);
 
 	ig.ninitiators = 1;
-	iname.name = NULL;
 	TAILQ_INSERT_TAIL(&ig.initiator_head, &iname, tailq);
 
 	/* portal group initialization */
@@ -771,28 +757,28 @@ allow_iscsi_name_multi_maps_case(void)
 	memset(&pg2, 0, sizeof(struct spdk_iscsi_portal_grp));
 	pg2.tag = 1;
 
-	pg_map1 = spdk_iscsi_tgt_node_add_pg_map(&tgtnode, &pg1);
-	pg_map2 = spdk_iscsi_tgt_node_add_pg_map(&tgtnode, &pg2);
-	spdk_iscsi_pg_map_add_ig_map(pg_map1, &ig);
-	spdk_iscsi_pg_map_add_ig_map(pg_map2, &ig);
+	pg_map1 = iscsi_tgt_node_add_pg_map(&tgtnode, &pg1);
+	pg_map2 = iscsi_tgt_node_add_pg_map(&tgtnode, &pg2);
+	iscsi_pg_map_add_ig_map(pg_map1, &ig);
+	iscsi_pg_map_add_ig_map(pg_map2, &ig);
 
 	/* test for IG1 <-> PG1, PG2 case */
 	iqn = IQN1;
 
-	iname.name = IQN1;
+	snprintf(iname.name, sizeof(iname.name), IQN1);
 
-	result = spdk_iscsi_tgt_node_allow_iscsi_name(&tgtnode, iqn);
+	result = iscsi_tgt_node_allow_iscsi_name(&tgtnode, iqn);
 	CU_ASSERT(result == true);
 
-	iname.name = IQN2;
+	snprintf(iname.name, sizeof(iname.name), IQN2);
 
-	result = spdk_iscsi_tgt_node_allow_iscsi_name(&tgtnode, iqn);
+	result = iscsi_tgt_node_allow_iscsi_name(&tgtnode, iqn);
 	CU_ASSERT(result == false);
 
-	spdk_iscsi_pg_map_delete_ig_map(pg_map1, &ig);
-	spdk_iscsi_pg_map_delete_ig_map(pg_map2, &ig);
-	spdk_iscsi_tgt_node_delete_pg_map(&tgtnode, &pg1);
-	spdk_iscsi_tgt_node_delete_pg_map(&tgtnode, &pg2);
+	iscsi_pg_map_delete_ig_map(pg_map1, &ig);
+	iscsi_pg_map_delete_ig_map(pg_map2, &ig);
+	iscsi_tgt_node_delete_pg_map(&tgtnode, &pg1);
+	iscsi_tgt_node_delete_pg_map(&tgtnode, &pg2);
 }
 
 /*

@@ -37,131 +37,157 @@
 
 #include "spdk/env.h"
 #include "spdk/queue.h"
+#include "spdk/util.h"
 
-/*
- * NOTE:
- * Functions in this file are mocks for SPDK based functions
- * and work conceptually in the same way that mocks work in
- * /lib/ut_mock. However, the globals that control the behavior
- * of the mock are defined here, with each function, as
- * opposed to being defined as part of the macro that defines
- * the stub or wrapper for other types of functions. Be sure
- * to use the correct global variable naming convention when
- * working with these functions. See /lib/ut_mock for details.
- */
-
-/*
- * these stubs have a return value set with one of the MOCK_SET macros
- */
 DEFINE_STUB(spdk_process_is_primary, bool, (void), true)
-
-DEFINE_STUB_VP(spdk_memzone_lookup, (const char *name), NULL)
+DEFINE_STUB(spdk_memzone_lookup, void *, (const char *name), NULL)
+DEFINE_STUB(spdk_pci_nvme_get_driver, struct spdk_pci_driver *, (void), NULL)
+DEFINE_STUB(spdk_pci_ioat_get_driver, struct spdk_pci_driver *, (void), NULL)
+DEFINE_STUB(spdk_pci_virtio_get_driver, struct spdk_pci_driver *, (void), NULL)
+DEFINE_STUB(spdk_env_get_first_core, uint32_t, (void), 0);
+DEFINE_STUB(spdk_env_get_next_core, uint32_t, (uint32_t prev_core), 0);
+DEFINE_STUB(spdk_env_get_last_core, uint32_t, (void), 1);
+DEFINE_STUB(spdk_env_get_current_core, uint32_t, (void), 0);
+DEFINE_STUB(spdk_env_get_socket_id, uint32_t, (uint32_t core), 0);
 
 /*
- * these mocks don't fit well with the library macro model because
- * they do 'something' other than just return a pre-set value
+ * These mocks don't use the DEFINE_STUB macros because
+ * their default implementation is more complex.
  */
 
-/* setup the mock control to pass thru by default */
-void *ut_p_spdk_memzone_reserve = MOCK_PASS_THRU_P;
+DEFINE_RETURN_MOCK(spdk_memzone_reserve, void *);
 void *
 spdk_memzone_reserve(const char *name, size_t len, int socket_id, unsigned flags)
 {
-	if (ut_p_spdk_memzone_reserve &&
-	    ut_p_spdk_memzone_reserve == MOCK_PASS_THRU_P) {
-		return malloc(len);
-	} else {
-		return ut_p_spdk_memzone_reserve;
-	}
+	HANDLE_RETURN_MOCK(spdk_memzone_reserve);
+
+	return malloc(len);
 }
 
-/* setup the mock control to pass thru by default */
-void *ut_p_spdk_memzone_reserve_aligned = MOCK_PASS_THRU_P;
+DEFINE_RETURN_MOCK(spdk_memzone_reserve_aligned, void *);
 void *
 spdk_memzone_reserve_aligned(const char *name, size_t len, int socket_id,
 			     unsigned flags, unsigned align)
 {
-	if (ut_p_spdk_memzone_reserve_aligned &&
-	    ut_p_spdk_memzone_reserve_aligned == MOCK_PASS_THRU_P) {
-		return malloc(len);
-	} else {
-		return ut_p_spdk_memzone_reserve_aligned;
-	}
+	HANDLE_RETURN_MOCK(spdk_memzone_reserve_aligned);
+
+	return malloc(len);
 }
 
-int ut_spdk_dma_malloc = (int)MOCK_PASS_THRU;
-void *ut_p_spdk_dma_malloc = &ut_spdk_dma_malloc;
+DEFINE_RETURN_MOCK(spdk_malloc, void *);
+void *
+spdk_malloc(size_t size, size_t align, uint64_t *phys_addr, int socket_id, uint32_t flags)
+{
+	HANDLE_RETURN_MOCK(spdk_malloc);
+
+	void *buf = NULL;
+
+	if (align == 0) {
+		align = 8;
+	}
+
+	if (posix_memalign(&buf, align, size)) {
+		return NULL;
+	}
+	if (phys_addr) {
+		*phys_addr = (uint64_t)buf;
+	}
+
+	return buf;
+}
+
+DEFINE_RETURN_MOCK(spdk_zmalloc, void *);
+void *
+spdk_zmalloc(size_t size, size_t align, uint64_t *phys_addr, int socket_id, uint32_t flags)
+{
+	HANDLE_RETURN_MOCK(spdk_zmalloc);
+
+	void *buf = spdk_malloc(size, align, phys_addr, -1, 1);
+
+	if (buf != NULL) {
+		memset(buf, 0, size);
+	}
+	return buf;
+}
+
+DEFINE_RETURN_MOCK(spdk_dma_malloc, void *);
 void *
 spdk_dma_malloc(size_t size, size_t align, uint64_t *phys_addr)
 {
-	if (ut_p_spdk_dma_malloc &&
-	    ut_spdk_dma_malloc == (int)MOCK_PASS_THRU) {
-		void *buf = NULL;
-		if (posix_memalign(&buf, align, size)) {
-			return NULL;
-		}
-		if (phys_addr) {
-			*phys_addr = (uint64_t)buf;
-		}
-		return buf;
-	} else {
-		return ut_p_spdk_dma_malloc;
-	}
+	HANDLE_RETURN_MOCK(spdk_dma_malloc);
+
+	return spdk_malloc(size, align, phys_addr, -1, 1);
 }
 
-int ut_spdk_dma_zmalloc = (int)MOCK_PASS_THRU;
-void *ut_p_spdk_dma_zmalloc = &ut_spdk_dma_zmalloc;
+DEFINE_RETURN_MOCK(spdk_realloc, void *);
 void *
-spdk_dma_zmalloc(size_t size, size_t align, uint64_t *phys_addr)
+spdk_realloc(void *buf, size_t size, size_t align)
 {
-	if (ut_p_spdk_dma_zmalloc &&
-	    ut_spdk_dma_zmalloc == (int)MOCK_PASS_THRU) {
-		void *buf = spdk_dma_malloc(size, align, phys_addr);
+	HANDLE_RETURN_MOCK(spdk_realloc);
 
-		if (buf != NULL) {
-			memset(buf, 0, size);
-		}
-		return buf;
-	} else {
-		return ut_p_spdk_dma_zmalloc;
-	}
-}
-
-void *
-spdk_dma_malloc_socket(size_t size, size_t align, uint64_t *phys_addr, int socket_id)
-{
-	return spdk_dma_malloc(size, align, phys_addr);
-}
-
-void *
-spdk_dma_zmalloc_socket(size_t size, size_t align, uint64_t *phys_addr, int socket_id)
-{
-	return spdk_dma_zmalloc(size, align, phys_addr);
-}
-
-void *
-spdk_dma_realloc(void *buf, size_t size, size_t align, uint64_t *phys_addr)
-{
 	return realloc(buf, size);
 }
 
-void spdk_dma_free(void *buf)
+DEFINE_RETURN_MOCK(spdk_dma_zmalloc, void *);
+void *
+spdk_dma_zmalloc(size_t size, size_t align, uint64_t *phys_addr)
 {
-	if (ut_p_spdk_dma_zmalloc &&
-	    ut_spdk_dma_zmalloc == (int)MOCK_PASS_THRU) {
-		free(buf);
-	}
+	HANDLE_RETURN_MOCK(spdk_dma_zmalloc);
+
+	return spdk_zmalloc(size, align, phys_addr, -1, 1);
 }
 
-bool ut_fail_vtophys = false;
-uint64_t spdk_vtophys(void *buf)
+DEFINE_RETURN_MOCK(spdk_dma_malloc_socket, void *);
+void *
+spdk_dma_malloc_socket(size_t size, size_t align, uint64_t *phys_addr, int socket_id)
 {
-	if (ut_fail_vtophys) {
-		return (uint64_t) - 1;
-	} else {
-		return (uintptr_t)buf;
-	}
+	HANDLE_RETURN_MOCK(spdk_dma_malloc_socket);
+
+	return spdk_dma_malloc(size, align, phys_addr);
 }
+
+DEFINE_RETURN_MOCK(spdk_dma_zmalloc_socket, void *);
+void *
+spdk_dma_zmalloc_socket(size_t size, size_t align, uint64_t *phys_addr, int socket_id)
+{
+	HANDLE_RETURN_MOCK(spdk_dma_zmalloc_socket);
+
+	return spdk_dma_zmalloc(size, align, phys_addr);
+}
+
+DEFINE_RETURN_MOCK(spdk_dma_realloc, void *);
+void *
+spdk_dma_realloc(void *buf, size_t size, size_t align, uint64_t *phys_addr)
+{
+	HANDLE_RETURN_MOCK(spdk_dma_realloc);
+
+	return realloc(buf, size);
+}
+
+void
+spdk_free(void *buf)
+{
+	/* fix for false-positives in *certain* static analysis tools. */
+	assert((uintptr_t)buf != UINTPTR_MAX);
+	free(buf);
+}
+
+void
+spdk_dma_free(void *buf)
+{
+	return spdk_free(buf);
+}
+
+#ifndef UNIT_TEST_NO_VTOPHYS
+DEFINE_RETURN_MOCK(spdk_vtophys, uint64_t);
+uint64_t
+spdk_vtophys(void *buf, uint64_t *size)
+{
+	HANDLE_RETURN_MOCK(spdk_vtophys);
+
+	return (uintptr_t)buf;
+}
+#endif
 
 void
 spdk_memzone_dump(FILE *f)
@@ -169,21 +195,28 @@ spdk_memzone_dump(FILE *f)
 	return;
 }
 
+DEFINE_RETURN_MOCK(spdk_memzone_free, int);
 int
 spdk_memzone_free(const char *name)
 {
+	HANDLE_RETURN_MOCK(spdk_memzone_free);
+
 	return 0;
 }
 
 struct test_mempool {
 	size_t	count;
+	size_t	ele_size;
 };
 
+DEFINE_RETURN_MOCK(spdk_mempool_create, struct spdk_mempool *);
 struct spdk_mempool *
 spdk_mempool_create(const char *name, size_t count,
 		    size_t ele_size, size_t cache_size, int socket_id)
 {
 	struct test_mempool *mp;
+
+	HANDLE_RETURN_MOCK(spdk_mempool_create);
 
 	mp = calloc(1, sizeof(*mp));
 	if (mp == NULL) {
@@ -191,6 +224,7 @@ spdk_mempool_create(const char *name, size_t count,
 	}
 
 	mp->count = count;
+	mp->ele_size = ele_size;
 
 	return (struct spdk_mempool *)mp;
 }
@@ -203,17 +237,25 @@ spdk_mempool_free(struct spdk_mempool *_mp)
 	free(mp);
 }
 
+DEFINE_RETURN_MOCK(spdk_mempool_get, void *);
 void *
 spdk_mempool_get(struct spdk_mempool *_mp)
 {
 	struct test_mempool *mp = (struct test_mempool *)_mp;
+	size_t ele_size = 0x10000;
 	void *buf;
+
+	HANDLE_RETURN_MOCK(spdk_mempool_get);
 
 	if (mp && mp->count == 0) {
 		return NULL;
 	}
 
-	if (posix_memalign(&buf, 64, 0x1000)) {
+	if (mp) {
+		ele_size = mp->ele_size;
+	}
+
+	if (posix_memalign(&buf, 64, spdk_align32pow2(ele_size))) {
 		return NULL;
 	} else {
 		if (mp) {
@@ -221,6 +263,18 @@ spdk_mempool_get(struct spdk_mempool *_mp)
 		}
 		return buf;
 	}
+}
+
+int
+spdk_mempool_get_bulk(struct spdk_mempool *mp, void **ele_arr, size_t count)
+{
+	for (size_t i = 0; i < count; i++) {
+		ele_arr[i] = spdk_mempool_get(mp);
+		if (ele_arr[i] == NULL) {
+			return -1;
+		}
+	}
+	return 0;
 }
 
 void
@@ -242,10 +296,13 @@ spdk_mempool_put_bulk(struct spdk_mempool *mp, void **ele_arr, size_t count)
 	}
 }
 
+DEFINE_RETURN_MOCK(spdk_mempool_count, size_t);
 size_t
 spdk_mempool_count(const struct spdk_mempool *_mp)
 {
 	struct test_mempool *mp = (struct test_mempool *)_mp;
+
+	HANDLE_RETURN_MOCK(spdk_mempool_count);
 
 	if (mp) {
 		return mp->count;
@@ -261,33 +318,60 @@ struct spdk_ring_ele {
 
 struct spdk_ring {
 	TAILQ_HEAD(, spdk_ring_ele) elements;
+	pthread_mutex_t lock;
+	size_t count;
 };
 
+DEFINE_RETURN_MOCK(spdk_ring_create, struct spdk_ring *);
 struct spdk_ring *
 spdk_ring_create(enum spdk_ring_type type, size_t count, int socket_id)
 {
 	struct spdk_ring *ring;
 
+	HANDLE_RETURN_MOCK(spdk_ring_create);
+
 	ring = calloc(1, sizeof(*ring));
-	if (ring) {
-		TAILQ_INIT(&ring->elements);
+	if (!ring) {
+		return NULL;
 	}
 
+	if (pthread_mutex_init(&ring->lock, NULL)) {
+		free(ring);
+		return NULL;
+	}
+
+	TAILQ_INIT(&ring->elements);
 	return ring;
 }
-
 
 void
 spdk_ring_free(struct spdk_ring *ring)
 {
+	struct spdk_ring_ele *ele, *tmp;
+
+	if (!ring) {
+		return;
+	}
+
+	TAILQ_FOREACH_SAFE(ele, &ring->elements, link, tmp) {
+		free(ele);
+	}
+
+	pthread_mutex_destroy(&ring->lock);
 	free(ring);
 }
 
+DEFINE_RETURN_MOCK(spdk_ring_enqueue, size_t);
 size_t
-spdk_ring_enqueue(struct spdk_ring *ring, void **objs, size_t count)
+spdk_ring_enqueue(struct spdk_ring *ring, void **objs, size_t count,
+		  size_t *free_space)
 {
 	struct spdk_ring_ele *ele;
 	size_t i;
+
+	HANDLE_RETURN_MOCK(spdk_ring_enqueue);
+
+	pthread_mutex_lock(&ring->lock);
 
 	for (i = 0; i < count; i++) {
 		ele = calloc(1, sizeof(*ele));
@@ -297,23 +381,31 @@ spdk_ring_enqueue(struct spdk_ring *ring, void **objs, size_t count)
 
 		ele->ele = objs[i];
 		TAILQ_INSERT_TAIL(&ring->elements, ele, link);
+		ring->count++;
 	}
 
+	pthread_mutex_unlock(&ring->lock);
 	return i;
 }
 
+DEFINE_RETURN_MOCK(spdk_ring_dequeue, size_t);
 size_t
 spdk_ring_dequeue(struct spdk_ring *ring, void **objs, size_t count)
 {
 	struct spdk_ring_ele *ele, *tmp;
 	size_t i = 0;
 
+	HANDLE_RETURN_MOCK(spdk_ring_dequeue);
+
 	if (count == 0) {
 		return 0;
 	}
 
+	pthread_mutex_lock(&ring->lock);
+
 	TAILQ_FOREACH_SAFE(ele, &ring->elements, link, tmp) {
 		TAILQ_REMOVE(&ring->elements, ele, link);
+		ring->count--;
 		objs[i] = ele->ele;
 		free(ele);
 		i++;
@@ -322,30 +414,53 @@ spdk_ring_dequeue(struct spdk_ring *ring, void **objs, size_t count)
 		}
 	}
 
+	pthread_mutex_unlock(&ring->lock);
 	return i;
 
 }
 
-uint64_t ut_tsc = 0;
-uint64_t spdk_get_ticks(void)
+
+DEFINE_RETURN_MOCK(spdk_ring_count, size_t);
+size_t
+spdk_ring_count(struct spdk_ring *ring)
 {
-	return ut_tsc;
+	HANDLE_RETURN_MOCK(spdk_ring_count);
+	return ring->count;
 }
 
-uint64_t spdk_get_ticks_hz(void)
+DEFINE_RETURN_MOCK(spdk_get_ticks, uint64_t);
+uint64_t
+spdk_get_ticks(void)
 {
+	HANDLE_RETURN_MOCK(spdk_get_ticks);
+
+	return ut_spdk_get_ticks;
+}
+
+DEFINE_RETURN_MOCK(spdk_get_ticks_hz, uint64_t);
+uint64_t
+spdk_get_ticks_hz(void)
+{
+	HANDLE_RETURN_MOCK(spdk_get_ticks_hz);
+
 	return 1000000;
 }
 
-void spdk_delay_us(unsigned int us)
+void
+spdk_delay_us(unsigned int us)
 {
-	ut_tsc += us;
+	/* spdk_get_ticks_hz is 1000000, meaning 1 tick per us. */
+	ut_spdk_get_ticks += us;
 }
 
+#ifndef UNIT_TEST_NO_PCI_ADDR
+DEFINE_RETURN_MOCK(spdk_pci_addr_parse, int);
 int
 spdk_pci_addr_parse(struct spdk_pci_addr *addr, const char *bdf)
 {
 	unsigned domain, bus, dev, func;
+
+	HANDLE_RETURN_MOCK(spdk_pci_addr_parse);
 
 	if (addr == NULL || bdf == NULL) {
 		return -EINVAL;
@@ -379,10 +494,13 @@ spdk_pci_addr_parse(struct spdk_pci_addr *addr, const char *bdf)
 	return 0;
 }
 
+DEFINE_RETURN_MOCK(spdk_pci_addr_fmt, int);
 int
 spdk_pci_addr_fmt(char *bdf, size_t sz, const struct spdk_pci_addr *addr)
 {
 	int rc;
+
+	HANDLE_RETURN_MOCK(spdk_pci_addr_fmt);
 
 	rc = snprintf(bdf, sz, "%04x:%02x:%02x.%x",
 		      addr->domain, addr->bus,
@@ -395,9 +513,12 @@ spdk_pci_addr_fmt(char *bdf, size_t sz, const struct spdk_pci_addr *addr)
 	return -1;
 }
 
+DEFINE_RETURN_MOCK(spdk_pci_addr_compare, int);
 int
 spdk_pci_addr_compare(const struct spdk_pci_addr *a1, const struct spdk_pci_addr *a2)
 {
+	HANDLE_RETURN_MOCK(spdk_pci_addr_compare);
+
 	if (a1->domain > a2->domain) {
 		return 1;
 	} else if (a1->domain < a2->domain) {
@@ -418,3 +539,4 @@ spdk_pci_addr_compare(const struct spdk_pci_addr *a1, const struct spdk_pci_addr
 
 	return 0;
 }
+#endif

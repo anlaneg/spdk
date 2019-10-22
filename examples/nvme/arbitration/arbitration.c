@@ -110,7 +110,7 @@ static struct ctrlr_entry *g_controllers	= NULL;
 static struct ns_entry *g_namespaces		= NULL;
 static struct worker_thread *g_workers		= NULL;
 
-static struct feature features[256];
+static struct feature features[SPDK_NVME_FEAT_ARBITRATION + 1] = {};
 
 static struct arb_context g_arbitration = {
 	.shm_id					= -1,
@@ -253,6 +253,7 @@ register_ctrlr(struct spdk_nvme_ctrlr *ctrlr)
 	int nsid, num_ns;
 	struct spdk_nvme_ns *ns;
 	struct ctrlr_entry *entry = calloc(1, sizeof(struct ctrlr_entry));
+	union spdk_nvme_cap_register cap = spdk_nvme_ctrlr_get_regs_cap(ctrlr);
 	const struct spdk_nvme_ctrlr_data *cdata = spdk_nvme_ctrlr_get_data(ctrlr);
 
 	if (entry == NULL) {
@@ -280,7 +281,8 @@ register_ctrlr(struct spdk_nvme_ctrlr *ctrlr)
 		register_ns(ctrlr, ns);
 	}
 
-	if (g_arbitration.arbitration_mechanism == SPDK_NVME_CAP_AMS_WRR) {
+	if (g_arbitration.arbitration_mechanism == SPDK_NVME_CAP_AMS_WRR &&
+	    (cap.bits.ams & SPDK_NVME_CAP_AMS_WRR)) {
 		get_arb_feature(ctrlr);
 
 		if (g_arbitration.arbitration_config != 0) {
@@ -434,8 +436,16 @@ cleanup(uint32_t task_count)
 	};
 
 	while (worker) {
+		struct ns_worker_ctx *ns_ctx = worker->ns_ctx;
+
+		/* ns_worker_ctx is a list in the worker */
+		while (ns_ctx) {
+			struct ns_worker_ctx *next_ns_ctx = ns_ctx->next;
+			free(ns_ctx);
+			ns_ctx = next_ns_ctx;
+		}
+
 		next_worker = worker->next;
-		free(worker->ns_ctx);
 		free(worker);
 		worker = next_worker;
 	};
@@ -689,50 +699,62 @@ parse_args(int argc, char **argv)
 	const char *workload_type	= NULL;
 	int op				= 0;
 	bool mix_specified		= false;
+	long int val;
 
 	while ((op = getopt(argc, argv, "c:l:i:m:q:s:t:w:M:a:b:n:h")) != -1) {
 		switch (op) {
 		case 'c':
 			g_arbitration.core_mask = optarg;
 			break;
-		case 'i':
-			g_arbitration.shm_id = atoi(optarg);
-			break;
-		case 'l':
-			g_arbitration.latency_tracking_enable = atoi(optarg);
-			break;
-		case 'm':
-			g_arbitration.max_completions = atoi(optarg);
-			break;
-		case 'q':
-			g_arbitration.queue_depth = atoi(optarg);
-			break;
-		case 's':
-			g_arbitration.io_size_bytes = atoi(optarg);
-			break;
-		case 't':
-			g_arbitration.time_in_sec = atoi(optarg);
-			break;
 		case 'w':
 			g_arbitration.workload_type = optarg;
 			break;
-		case 'M':
-			g_arbitration.rw_percentage = atoi(optarg);
-			mix_specified = true;
-			break;
-		case 'a':
-			g_arbitration.arbitration_mechanism = atoi(optarg);
-			break;
-		case 'b':
-			g_arbitration.arbitration_config = atoi(optarg);
-			break;
-		case 'n':
-			g_arbitration.io_count = atoi(optarg);
-			break;
 		case 'h':
-		default:
+		case '?':
 			usage(argv[0]);
 			return 1;
+		default:
+			val = spdk_strtol(optarg, 10);
+			if (val < 0) {
+				fprintf(stderr, "Converting a string to integer failed\n");
+				return val;
+			}
+			switch (op) {
+			case 'i':
+				g_arbitration.shm_id = val;
+				break;
+			case 'l':
+				g_arbitration.latency_tracking_enable = val;
+				break;
+			case 'm':
+				g_arbitration.max_completions = val;
+				break;
+			case 'q':
+				g_arbitration.queue_depth = val;
+				break;
+			case 's':
+				g_arbitration.io_size_bytes = val;
+				break;
+			case 't':
+				g_arbitration.time_in_sec = val;
+				break;
+			case 'M':
+				g_arbitration.rw_percentage = val;
+				mix_specified = true;
+				break;
+			case 'a':
+				g_arbitration.arbitration_mechanism = val;
+				break;
+			case 'b':
+				g_arbitration.arbitration_config = val;
+				break;
+			case 'n':
+				g_arbitration.io_count = val;
+				break;
+			default:
+				usage(argv[0]);
+				return -EINVAL;
+			}
 		}
 	}
 
@@ -974,11 +996,14 @@ static int
 get_feature(struct spdk_nvme_ctrlr *ctrlr, uint8_t fid)
 {
 	struct spdk_nvme_cmd cmd = {};
+	struct feature *feature = &features[fid];
+
+	feature->valid = false;
 
 	cmd.opc = SPDK_NVME_OPC_GET_FEATURES;
 	cmd.cdw10 = fid;
 
-	return spdk_nvme_ctrlr_cmd_admin_raw(ctrlr, &cmd, NULL, 0, get_feature_completion, &features[fid]);
+	return spdk_nvme_ctrlr_cmd_admin_raw(ctrlr, &cmd, NULL, 0, get_feature_completion, feature);
 }
 
 static void

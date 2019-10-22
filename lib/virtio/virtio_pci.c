@@ -38,6 +38,7 @@
 #include "spdk/env.h"
 
 #include "spdk_internal/virtio.h"
+#include "spdk_internal/memory.h"
 
 struct virtio_hw {
 	uint8_t	    use_msix;
@@ -121,9 +122,8 @@ pci_dump_json_info(struct virtio_dev *dev, struct spdk_json_write_ctx *w)
 		spdk_json_write_string(w, "pci-legacy");
 	}
 
-	spdk_json_write_name(w, "pci_address");
 	spdk_pci_addr_fmt(addr, sizeof(addr), &pci_addr);
-	spdk_json_write_string(w, addr);
+	spdk_json_write_named_string(w, "pci_address", addr);
 }
 
 static void
@@ -206,7 +206,7 @@ modern_set_features(struct virtio_dev *dev, uint64_t features)
 
 	if ((features & (1ULL << VIRTIO_F_VERSION_1)) == 0) {
 		SPDK_ERRLOG("VIRTIO_F_VERSION_1 feature is not enabled.\n");
-		return -1;
+		return -EINVAL;
 	}
 
 	spdk_mmio_write_4(&hw->common_cfg->guest_feature_select, 0);
@@ -264,16 +264,32 @@ modern_setup_queue(struct virtio_dev *dev, struct virtqueue *vq)
 	void *queue_mem;
 	uint64_t queue_mem_phys_addr;
 
-	queue_mem = spdk_dma_zmalloc(vq->vq_ring_size, VIRTIO_PCI_VRING_ALIGN, &queue_mem_phys_addr);
+	/* To ensure physical address contiguity we make the queue occupy
+	 * only a single hugepage (2MB). As of Virtio 1.0, the queue size
+	 * always falls within this limit.
+	 */
+	if (vq->vq_ring_size > VALUE_2MB) {
+		return -ENOMEM;
+	}
+
+	queue_mem = spdk_zmalloc(vq->vq_ring_size, VALUE_2MB, NULL,
+				 SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
 	if (queue_mem == NULL) {
 		return -ENOMEM;
+	}
+
+	queue_mem_phys_addr = spdk_vtophys(queue_mem, NULL);
+	if (queue_mem_phys_addr == SPDK_VTOPHYS_ERROR) {
+		spdk_free(queue_mem);
+		return -EFAULT;
 	}
 
 	vq->vq_ring_mem = queue_mem_phys_addr;
 	vq->vq_ring_virt_mem = queue_mem;
 
 	if (!check_vq_phys_addr_ok(vq)) {
-		return -1;
+		spdk_free(queue_mem);
+		return -ENOMEM;
 	}
 
 	desc_addr = vq->vq_ring_mem;
@@ -322,7 +338,7 @@ modern_del_queue(struct virtio_dev *dev, struct virtqueue *vq)
 
 	spdk_mmio_write_2(&hw->common_cfg->queue_enable, 0);
 
-	spdk_dma_free(vq->vq_ring_virt_mem);
+	spdk_free(vq->vq_ring_virt_mem);
 }
 
 static void
@@ -389,7 +405,7 @@ virtio_read_caps(struct virtio_hw *hw)
 	ret = spdk_pci_device_cfg_read(hw->pci_dev, &pos, 1, PCI_CAPABILITY_LIST);
 	if (ret < 0) {
 		SPDK_DEBUGLOG(SPDK_LOG_VIRTIO_PCI, "failed to read pci capability list\n");
-		return -1;
+		return ret;
 	}
 
 	while (pos) {
@@ -438,7 +454,11 @@ next:
 	if (hw->common_cfg == NULL || hw->notify_base == NULL ||
 	    hw->dev_cfg == NULL    || hw->isr == NULL) {
 		SPDK_DEBUGLOG(SPDK_LOG_VIRTIO_PCI, "no modern virtio pci device found.\n");
-		return -1;
+		if (ret < 0) {
+			return ret;
+		} else {
+			return -EINVAL;
+		}
 	}
 
 	SPDK_DEBUGLOG(SPDK_LOG_VIRTIO_PCI, "found modern virtio pci device.\n");
@@ -536,7 +556,8 @@ virtio_pci_dev_enumerate(virtio_pci_create_cb enum_cb, void *enum_ctx,
 	ctx.enum_ctx = enum_ctx;
 	ctx.device_id = pci_device_id;
 
-	return spdk_pci_virtio_enumerate(virtio_pci_dev_probe_cb, &ctx);
+	return spdk_pci_enumerate(spdk_pci_virtio_get_driver(),
+				  virtio_pci_dev_probe_cb, &ctx);
 }
 
 int
@@ -554,7 +575,8 @@ virtio_pci_dev_attach(virtio_pci_create_cb enum_cb, void *enum_ctx,
 	ctx.enum_ctx = enum_ctx;
 	ctx.device_id = pci_device_id;
 
-	return spdk_pci_virtio_device_attach(virtio_pci_dev_probe_cb, &ctx, pci_address);
+	return spdk_pci_device_attach(spdk_pci_virtio_get_driver(),
+				      virtio_pci_dev_probe_cb, &ctx, pci_address);
 }
 
 int
@@ -565,7 +587,7 @@ virtio_pci_dev_init(struct virtio_dev *vdev, const char *name,
 
 	rc = virtio_dev_construct(vdev, name, &modern_ops, pci_ctx);
 	if (rc != 0) {
-		return -1;
+		return rc;
 	}
 
 	vdev->is_hw = 1;

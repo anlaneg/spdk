@@ -53,12 +53,15 @@ struct spdk_sock_group;
  * \param sock Socket to get address.
  * \param saddr A pointer to the buffer to hold the address of server.
  * \param slen Length of the buffer 'saddr'.
+ * \param sport A pointer(May be NULL) to the buffer to hold the port info of server.
  * \param caddr A pointer to the buffer to hold the address of client.
  * \param clen Length of the buffer 'caddr'.
+ * \param cport A pointer(May be NULL) to the buffer to hold the port info of server.
  *
  * \return 0 on success, -1 on failure.
  */
-int spdk_sock_getaddr(struct spdk_sock *sock, char *saddr, int slen, char *caddr, int clen);
+int spdk_sock_getaddr(struct spdk_sock *sock, char *saddr, int slen, uint16_t *sport,
+		      char *caddr, int clen, uint16_t *cport);
 
 /**
  * Create a socket, connect the socket to the specified address and port (of the
@@ -124,6 +127,17 @@ ssize_t spdk_sock_recv(struct spdk_sock *sock, void *buf, size_t len);
 ssize_t spdk_sock_writev(struct spdk_sock *sock, struct iovec *iov, int iovcnt);
 
 /**
+ * Read message from the given socket to the I/O vector array.
+ *
+ * \param sock Socket to receive message.
+ * \param iov I/O vector.
+ * \param iovcnt Number of I/O vectors in the array.
+ *
+ * \return the length of the received message on success, -1 on failure.
+ */
+ssize_t spdk_sock_readv(struct spdk_sock *sock, struct iovec *iov, int iovcnt);
+
+/**
  * Set the value used to specify the low water mark (in bytes) for this socket.
  *
  * \param sock Socket to set for.
@@ -142,6 +156,16 @@ int spdk_sock_set_recvlowat(struct spdk_sock *sock, int nbytes);
  * \return 0 on success, -1 on failure.
  */
 int spdk_sock_set_recvbuf(struct spdk_sock *sock, int sz);
+
+/**
+ * Set priority for the given socket.
+ *
+ * \param sock Socket to set the priority.
+ * \param priority Priority given by the user.
+ *
+ * \return 0 on success, -1 on failure.
+ */
+int spdk_sock_set_priority(struct spdk_sock *sock, int priority);
 
 /**
  * Set send buffer size for the given socket.
@@ -172,6 +196,15 @@ bool spdk_sock_is_ipv6(struct spdk_sock *sock);
 bool spdk_sock_is_ipv4(struct spdk_sock *sock);
 
 /**
+ * Check whether the socket is currently connected.
+ *
+ * \param sock Socket to check
+ *
+ * \return true if the socket is connected or false otherwise.
+ */
+bool spdk_sock_is_connected(struct spdk_sock *sock);
+
+/**
  * Callback function for spdk_sock_group_add_sock().
  *
  * \param arg Argument for the callback function.
@@ -181,11 +214,21 @@ bool spdk_sock_is_ipv4(struct spdk_sock *sock);
 typedef void (*spdk_sock_cb)(void *arg, struct spdk_sock_group *group, struct spdk_sock *sock);
 
 /**
- * Create a new socket group.
+ * Create a new socket group with user provided pointer
  *
+ * \param ctx the context provided by user.
  * \return a pointer to the created group on success, or NULL on failure.
  */
-struct spdk_sock_group *spdk_sock_group_create(void);
+struct spdk_sock_group *spdk_sock_group_create(void *ctx);
+
+/**
+ * Get the ctx of the sock group
+ *
+ * \param sock_group Socket group.
+ * \return a pointer which is ctx of the sock_group.
+ */
+void *spdk_sock_group_get_ctx(struct spdk_sock_group *sock_group);
+
 
 /**
  * Add a socket to the group.
@@ -215,7 +258,7 @@ int spdk_sock_group_remove_sock(struct spdk_sock_group *group, struct spdk_sock 
  *
  * \param group Group to poll.
  *
- * \return 0 on success, -1 on failure.
+ * \return the number of events on success, -1 on failure.
  */
 int spdk_sock_group_poll(struct spdk_sock_group *group);
 
@@ -237,6 +280,16 @@ int spdk_sock_group_poll_count(struct spdk_sock_group *group, int max_events);
  * \return 0 on success, -1 on failure.
  */
 int spdk_sock_group_close(struct spdk_sock_group **group);
+
+/**
+ * Get the optimal sock group for this sock.
+ *
+ * \param sock The socket
+ * \param group Returns the optimal sock group. If there is no optimal sock group, returns NULL.
+ *
+ * \return 0 on success. Negated errno on failure.
+ */
+int spdk_sock_get_optimal_sock_group(struct spdk_sock *sock, struct spdk_sock_group **group);
 
 #ifdef __cplusplus
 }

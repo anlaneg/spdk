@@ -38,26 +38,13 @@
 
 #include "spdk/vhost.h"
 
-
-#define SPDK_VHOST_DEFAULT_CONFIG "/usr/local/etc/spdk/vhost.conf"
-#define SPDK_VHOST_DEFAULT_MEM_SIZE 1024
-
 static const char *g_pid_path = NULL;
-
-static void
-vhost_app_opts_init(struct spdk_app_opts *opts)
-{
-	spdk_app_opts_init(opts);
-	opts->name = "vhost";
-	opts->config_file = SPDK_VHOST_DEFAULT_CONFIG;
-	opts->mem_size = SPDK_VHOST_DEFAULT_MEM_SIZE;
-}
 
 static void
 vhost_usage(void)
 {
-	printf(" -f pidfile save pid to file under given path\n");
-	printf(" -S dir     directory where to create vhost sockets (default: pwd)\n");
+	printf(" -f <path>                 save pid to file under given path\n");
+	printf(" -S <path>                 directory where to create vhost sockets (default: pwd)\n");
 }
 
 static void
@@ -75,7 +62,7 @@ save_pid(const char *pid_path)
 	fclose(pid_file);
 }
 
-static void
+static int
 vhost_parse_arg(int ch, char *arg)
 {
 	switch (ch) {
@@ -85,11 +72,14 @@ vhost_parse_arg(int ch, char *arg)
 	case 'S':
 		spdk_vhost_set_socket_path(arg);
 		break;
+	default:
+		return -EINVAL;
 	}
+	return 0;
 }
 
 static void
-vhost_started(void *arg1, void *arg2)
+vhost_started(void *arg1)
 {
 }
 
@@ -99,9 +89,10 @@ main(int argc, char *argv[])
 	struct spdk_app_opts opts = {};
 	int rc;
 
-	vhost_app_opts_init(&opts);
+	spdk_app_opts_init(&opts);
+	opts.name = "vhost";
 
-	if ((rc = spdk_app_parse_args(argc, argv, &opts, "f:S:",
+	if ((rc = spdk_app_parse_args(argc, argv, &opts, "f:S:", NULL,
 				      vhost_parse_arg, vhost_usage)) !=
 	    SPDK_APP_PARSE_ARGS_SUCCESS) {
 		exit(rc);
@@ -112,7 +103,7 @@ main(int argc, char *argv[])
 	}
 
 	/* Blocks until the application is exiting */
-	rc = spdk_app_start(&opts, vhost_started, NULL, NULL);
+	rc = spdk_app_start(&opts, vhost_started, NULL);
 
 	spdk_app_fini();
 

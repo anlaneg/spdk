@@ -48,15 +48,15 @@ to as virtual bdevs, or *vbdevs* for short.
 ## Initializing The Library
 
 The bdev layer depends on the generic message passing infrastructure
-abstracted by the header file include/io_channel.h. See @ref concurrency for a
+abstracted by the header file include/spdk/thread.h. See @ref concurrency for a
 full description. Most importantly, calls into the bdev library may only be
 made from threads that have been allocated with SPDK by calling
-spdk_allocate_thread().
+spdk_thread_create().
 
 From an allocated thread, the bdev library may be initialized by calling
 spdk_bdev_initialize(), which is an asynchronous operation. Until the completion
 callback is called, no other bdev library functions may be invoked. Similarly,
-to tear down the bdev library, call spdk_bdev_finish.
+to tear down the bdev library, call spdk_bdev_finish().
 
 ## Discovering Block Devices
 
@@ -72,7 +72,7 @@ name to look up the block device.
 ## Preparing To Use A Block Device
 
 In order to send I/O requests to a block device, it must first be opened by
-calling spdk_bdev_open(). This will return a descriptor. Multiple users may have
+calling spdk_bdev_open_ext(). This will return a descriptor. Multiple users may have
 a bdev open at the same time, and coordination of reads and writes between
 users must be handled by some higher level mechanism outside of the bdev
 layer. Opening a bdev with write permission may fail if a virtual bdev module
@@ -81,13 +81,14 @@ logical volume management and forward their I/O to lower level bdevs, so they
 mark these lower level bdevs as claimed to prevent outside users from issuing
 writes.
 
-When a block device is opened, an optional callback and context can be
-provided that will be called if the underlying storage servicing the block
-device is removed. For example, the remove callback will be called on each
-open descriptor for a bdev backed by a physical NVMe SSD when the NVMe SSD is
-hot-unplugged. The callback can be thought of as a request to close the open
-descriptor so other memory may be freed. A bdev cannot be torn down while open
-descriptors exist, so it is highly recommended that a callback is provided.
+When a block device is opened, a callback and context must be provided that
+will be called with appropriate spdk_bdev_event_type enum as an argument when
+the bdev triggers asynchronous event such as bdev removal. For example,
+the callback will be called on each open descriptor for a bdev backed by
+a physical NVMe SSD when the NVMe SSD is hot-unplugged. In this case
+the callback can be thought of as a request to close the open descriptor so
+other memory may be freed. A bdev cannot be torn down while open descriptors
+exist, so it is required that a callback is provided.
 
 When a user is done with a descriptor, they may release it by calling
 spdk_bdev_close().
@@ -105,7 +106,7 @@ Once a descriptor and a channel have been obtained, I/O may be sent by calling
 the various I/O submission functions such as spdk_bdev_read(). These calls each
 take a callback as an argument which will be called some time later with a
 handle to an spdk_bdev_io object. In response to that completion, the user
-must call spdk_free_bdev_io() to release the resources. Within this callback,
+must call spdk_bdev_free_io() to release the resources. Within this callback,
 the user may also use the functions spdk_bdev_io_get_nvme_status() and
 spdk_bdev_io_get_scsi_status() to obtain error information in the format of
 their choosing.

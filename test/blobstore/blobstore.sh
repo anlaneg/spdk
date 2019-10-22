@@ -1,19 +1,16 @@
 #!/usr/bin/env bash
 
-SYSTEM=`uname -s`
+SYSTEM=$(uname -s)
 if [ $SYSTEM = "FreeBSD" ] ; then
     echo "blobstore.sh cannot run on FreeBSD currently."
     exit 0
 fi
 
-set -xe
-
 testdir=$(readlink -f $(dirname $0))
 rootdir=$(readlink -f $testdir/../..)
 source $rootdir/test/common/autotest_common.sh
-timing_enter blobstore
 
-set -e
+timing_enter blobstore
 
 # Nvme0 target configuration
 $rootdir/scripts/gen_nvme.sh > $testdir/blobcli.conf

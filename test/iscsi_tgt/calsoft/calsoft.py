@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import os
 import time
 import sys
@@ -35,10 +37,10 @@ known_failed_cases = ['tc_ffp_15_2', 'tc_ffp_29_2', 'tc_ffp_29_3', 'tc_ffp_29_4'
 
 def run_case(case, result_list, log_dir_path):
     try:
-        case_log = subprocess.check_output("{}/{}".format(CALSOFT_BIN_PATH, case), stderr=subprocess.STDOUT, shell=True)
+        case_log = subprocess.check_output("{}/{}".format(CALSOFT_BIN_PATH, case), stderr=subprocess.STDOUT, shell=True).decode('utf-8')
     except subprocess.CalledProcessError as e:
         result_list.append({"Name": case, "Result": "FAIL"})
-        case_log = e.output
+        case_log = e.output.decode('utf-8')
     else:
         result_list.append({"Name": case, "Result": "PASS"})
     with open(log_dir_path + case + '.txt', 'w') as f:
@@ -47,7 +49,7 @@ def run_case(case, result_list, log_dir_path):
 
 def main():
     if not os.path.exists(CALSOFT_BIN_PATH):
-        print "The Calsoft test suite is not available on this machine."
+        print("The Calsoft test suite is not available on this machine.")
         sys.exit(1)
 
     output_dir = sys.argv[1]
@@ -68,7 +70,7 @@ def main():
     if not os.path.exists(log_dir):
         os.mkdir(log_dir)
     for case in known_failed_cases:
-        print "Skipping %s. It is known to fail." % (case)
+        print("Skipping %s. It is known to fail." % (case))
         case_result_list.append({"Name": case, "Result": "SKIP"})
 
     thread_objs = []
@@ -96,7 +98,7 @@ def main():
         else:
             break
     else:
-        print "Thread timeout"
+        print("Thread timeout")
         exit(1)
     with open(output_file, 'w') as f:
         json.dump(obj=result, fp=f, indent=2)
@@ -104,7 +106,7 @@ def main():
     failed = 0
     for x in case_result_list:
         if x["Result"] == "FAIL":
-            print "Test case %s failed." % (x["Name"])
+            print("Test case %s failed." % (x["Name"]))
             failed = 1
     exit(failed)
 

@@ -36,45 +36,79 @@ S :=
 SPDK_ROOT_DIR := $(CURDIR)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
-DIRS-y += lib shared_lib examples app include
+DIRS-y += lib
+DIRS-y += module
+DIRS-$(CONFIG_SHARED) += shared_lib
+DIRS-y += examples app include
 DIRS-$(CONFIG_TESTS) += test
+DIRS-$(CONFIG_IPSEC_MB) += ipsecbuild
+DIRS-$(CONFIG_ISAL) += isalbuild
 
-.PHONY: all clean $(DIRS-y) config.h CONFIG.local mk/cc.mk cc_version cxx_version
+.PHONY: all clean $(DIRS-y) include/spdk/config.h mk/config.mk \
+	cc_version cxx_version .libs_only_other .ldflags ldflags install \
+	uninstall
 
+ifeq ($(SPDK_ROOT_DIR)/lib/env_dpdk,$(CONFIG_ENV))
 ifeq ($(CURDIR)/dpdk/build,$(CONFIG_DPDK_DIR))
 ifneq ($(SKIP_DPDK_BUILD),1)
 DPDKBUILD = dpdkbuild
 DIRS-y += dpdkbuild
 endif
 endif
+endif
 
-all: $(DIRS-y)
+ifeq ($(CONFIG_SHARED),y)
+LIB = shared_lib
+else
+LIB = module
+endif
+
+ifeq ($(CONFIG_IPSEC_MB),y)
+LIB += ipsecbuild
+DPDK_DEPS += ipsecbuild
+endif
+
+ifeq ($(CONFIG_ISAL),y)
+LIB += isalbuild
+DPDK_DEPS += isalbuild
+endif
+
+all: mk/cc.mk $(DIRS-y)
 clean: $(DIRS-y)
-	$(Q)rm -f mk/cc.mk
-	$(Q)rm -f config.h
+	$(Q)rm -f include/spdk/config.h
 
 install: all
 	$(Q)echo "Installed to $(DESTDIR)$(CONFIG_PREFIX)"
 
-shared_lib: lib
+uninstall: $(DIRS-y)
+	$(Q)echo "Uninstalled spdk"
+
+ifneq ($(SKIP_DPDK_BUILD),1)
+dpdkbuild: $(DPDK_DEPS)
+endif
+
 lib: $(DPDKBUILD)
-app: lib
-test: lib
-examples: lib
+module: lib
+shared_lib: module
+app: $(LIB)
+test: $(LIB)
+examples: $(LIB)
 pkgdep:
 	sh ./scripts/pkgdep.sh
 
-$(DIRS-y): mk/cc.mk config.h
+$(DIRS-y): include/spdk/config.h
 
 mk/cc.mk:
-	$(Q)scripts/detect_cc.sh --cc=$(CC) --cxx=$(CXX) --lto=$(CONFIG_LTO) > $@.tmp; \
-	cmp -s $@.tmp $@ || mv $@.tmp $@ ; \
-	rm -f $@.tmp
+	$(Q)echo "Please run configure prior to make"
+	false
 
-config.h: CONFIG CONFIG.local scripts/genconfig.py
+include/spdk/config.h: mk/config.mk scripts/genconfig.py
 	$(Q)PYCMD=$$(cat PYTHON_COMMAND 2>/dev/null) ; \
 	test -z "$$PYCMD" && PYCMD=python ; \
-	$$PYCMD scripts/genconfig.py $(MAKEFLAGS) > $@.tmp; \
+	echo "#ifndef SPDK_CONFIG_H" > $@.tmp; \
+	echo "#define SPDK_CONFIG_H" >> $@.tmp; \
+	$$PYCMD scripts/genconfig.py $(MAKEFLAGS) >> $@.tmp; \
+	echo "#endif /* SPDK_CONFIG_H */" >> $@.tmp; \
 	cmp -s $@.tmp $@ || mv $@.tmp $@ ; \
 	rm -f $@.tmp
 
@@ -83,5 +117,17 @@ cc_version: mk/cc.mk
 
 cxx_version: mk/cc.mk
 	$(Q)echo "SPDK using CXX=$(CXX)"; $(CXX) -v
+
+.libs_only_other:
+	$(Q)echo -n '$(SYS_LIBS) '
+	$(Q)if [ "$(CONFIG_SHARED)" = "y" ]; then \
+		echo -n '-lspdk '; \
+	fi
+
+.ldflags:
+	$(Q)echo -n '$(LDFLAGS) '
+
+ldflags: .ldflags .libs_only_other
+	$(Q)echo ''
 
 include $(SPDK_ROOT_DIR)/mk/spdk.subdirs.mk

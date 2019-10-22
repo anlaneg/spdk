@@ -1,12 +1,13 @@
-source $SPDK_BUILD_DIR/test/nvmf/common.sh
-source $MIGRATION_DIR/autotest.config
+source $rootdir/test/nvmf/common.sh
+source $testdir/autotest.config
 
 incoming_vm=1
 target_vm=2
 incoming_vm_ctrlr=naa.VhostScsi0.$incoming_vm
 target_vm_ctrlr=naa.VhostScsi0.$target_vm
 share_dir=$TEST_DIR/share
-job_file=$MIGRATION_DIR/migration-tc3.job
+spdk_repo_share_dir=$TEST_DIR/share_spdk
+job_file=$testdir/migration-tc3.job
 
 if [ -z "$MGMT_TARGET_IP" ]; then
 	error "No IP address of target is given"
@@ -26,10 +27,12 @@ fi
 
 function ssh_remote()
 {
-	local ssh_cmd="ssh -i $SPDK_VHOST_SSH_KEY_FILE \
+	local ssh_cmd="sshpass -p root ssh \
 		-o UserKnownHostsFile=/dev/null \
-		-o StrictHostKeyChecking=no -o ControlMaster=auto \
-		root@$1"
+		-o StrictHostKeyChecking=no \
+		-o ControlMaster=auto \
+		-o User=root \
+		$1"
 
 	shift
 	$ssh_cmd "$@"
@@ -66,7 +69,7 @@ function check_rdma_connection()
 function host1_cleanup_nvmf()
 {
 	notice "Shutting down nvmf_tgt on local server"
-	if [[ ! -z "$1" ]]; then
+	if [[ -n "$1" ]]; then
 		pkill --signal $1 -F $nvmf_dir/nvmf_tgt.pid
 	else
 		pkill -F $nvmf_dir/nvmf_tgt.pid
@@ -81,11 +84,11 @@ function host1_cleanup_vhost()
 	vm_kill $incoming_vm
 
 	notice "Removing bdev & controller from vhost on local server"
-	$rpc_0 delete_bdev Nvme0n1
-	$rpc_0 remove_vhost_controller $incoming_vm_ctrlr
+	$rpc_0 bdev_nvme_detach_controller Nvme0
+	$rpc_0 vhost_delete_controller $incoming_vm_ctrlr
 
 	notice "Shutting down vhost app"
-	spdk_vhost_kill 0
+	vhost_kill 0
 
 	host1_cleanup_nvmf
 }
@@ -93,35 +96,36 @@ function host1_cleanup_vhost()
 function host1_start_nvmf()
 {
 	nvmf_dir="$TEST_DIR/nvmf_tgt"
-	rpc_nvmf="python $SPDK_BUILD_DIR/scripts/rpc.py -s $nvmf_dir/nvmf_rpc.sock"
+	rpc_nvmf="$rootdir/scripts/rpc.py -s $nvmf_dir/nvmf_rpc.sock"
 
 	notice "Starting nvmf_tgt instance on local server"
 	mkdir -p $nvmf_dir
 	rm -rf $nvmf_dir/*
 
-	cp $SPDK_BUILD_DIR/test/nvmf/nvmf.conf $nvmf_dir/nvmf.conf
-	$SPDK_BUILD_DIR/scripts/gen_nvme.sh >> $nvmf_dir/nvmf.conf
-
 	trap 'host1_cleanup_nvmf SIGKILL; error_exit "${FUNCNAME}" "${LINENO}"' INT ERR EXIT
-	$SPDK_BUILD_DIR/app/nvmf_tgt/nvmf_tgt -s 512 -c $nvmf_dir/nvmf.conf -r $nvmf_dir/nvmf_rpc.sock &
+	$rootdir/app/nvmf_tgt/nvmf_tgt -s 512 -m 0xF -r $nvmf_dir/nvmf_rpc.sock --wait-for-rpc &
 	nvmf_tgt_pid=$!
 	echo $nvmf_tgt_pid > $nvmf_dir/nvmf_tgt.pid
 	waitforlisten "$nvmf_tgt_pid" "$nvmf_dir/nvmf_rpc.sock"
+	$rpc_nvmf framework_start_init
+	$rpc_nvmf nvmf_create_transport -t RDMA -u 8192
+	$rootdir/scripts/gen_nvme.sh --json | $rpc_nvmf load_subsystem_config
 
-	$rpc_nvmf construct_nvmf_subsystem nqn.2018-02.io.spdk:cnode1 \
-		"trtype:RDMA traddr:$RDMA_TARGET_IP trsvcid:4420" "" -a -s SPDK01 -n Nvme0n1
+	$rpc_nvmf nvmf_create_subsystem nqn.2018-02.io.spdk:cnode1 -a -s SPDK01
+	$rpc_nvmf nvmf_subsystem_add_ns nqn.2018-02.io.spdk:cnode1 Nvme0n1
+	$rpc_nvmf nvmf_subsystem_add_listener nqn.2018-02.io.spdk:cnode1 -t rdma -a $RDMA_TARGET_IP -s 4420
 }
 
 function host1_start_vhost()
 {
-	rpc_0="python $SPDK_BUILD_DIR/scripts/rpc.py -s $(get_vhost_dir 0)/rpc.sock"
+	rpc_0="$rootdir/scripts/rpc.py -s $(get_vhost_dir 0)/rpc.sock"
 
 	notice "Starting vhost0 instance on local server"
 	trap 'host1_cleanup_vhost; error_exit "${FUNCNAME}" "${LINENO}"' INT ERR EXIT
-	spdk_vhost_run --vhost-num=0 --no-pci
-	$rpc_0 construct_nvme_bdev -b Nvme0 -t rdma -f ipv4 -a $RDMA_TARGET_IP -s 4420 -n "nqn.2018-02.io.spdk:cnode1"
-	$rpc_0 construct_vhost_scsi_controller $incoming_vm_ctrlr
-	$rpc_0 add_vhost_scsi_lun $incoming_vm_ctrlr 0 Nvme0n1
+	vhost_run 0 "-u"
+	$rpc_0 bdev_nvme_attach_controller -b Nvme0 -t rdma -f ipv4 -a $RDMA_TARGET_IP -s 4420 -n "nqn.2018-02.io.spdk:cnode1"
+	$rpc_0 vhost_create_scsi_controller $incoming_vm_ctrlr
+	$rpc_0 vhost_scsi_controller_add_target $incoming_vm_ctrlr 0 Nvme0n1
 
 	vm_setup --os="$share_dir/migration.qcow2" --force=$incoming_vm --disk-type=spdk_vhost_scsi --disks=VhostScsi0 \
 		--migrate-to=$target_vm --memory=512 --queue_num=1
@@ -139,7 +143,7 @@ function cleanup_share()
 	set +e
 	notice "Cleaning up share directory on remote and local server"
 	ssh_remote $MGMT_INITIATOR_IP "umount $VM_BASE_DIR"
-	ssh_remote $MGMT_INITIATOR_IP "umount $share_dir; rm -f $share_dir/*"
+	ssh_remote $MGMT_INITIATOR_IP "umount $share_dir; rm -f $share_dir/* rm -rf $spdk_repo_share_dir"
 	rm -f $share_dir/migration.qcow2
 	rm -f $share_dir/spdk.tar.gz
 	set -e
@@ -152,7 +156,7 @@ function host_1_create_share()
 	mkdir -p $VM_BASE_DIR # This dir would've been created later but we need it now
 	rm -rf $share_dir/spdk.tar.gz $share_dir/spdk || true
 	cp $os_image $share_dir/migration.qcow2
-	tar --exclude="*.o"--exclude="*.d" --exclude="*.git" -C $SPDK_BUILD_DIR -zcf $share_dir/spdk.tar.gz .
+	tar --exclude="*.o"--exclude="*.d" --exclude="*.git" -C $rootdir -zcf $share_dir/spdk.tar.gz .
 }
 
 function host_2_create_share()
@@ -160,6 +164,7 @@ function host_2_create_share()
 	# Copy & compile the sources for later use on remote server.
 	ssh_remote $MGMT_INITIATOR_IP "uname -a"
 	ssh_remote $MGMT_INITIATOR_IP "mkdir -p $share_dir"
+	ssh_remote $MGMT_INITIATOR_IP "mkdir -p $spdk_repo_share_dir"
 	ssh_remote $MGMT_INITIATOR_IP "mkdir -p $VM_BASE_DIR"
 	ssh_remote $MGMT_INITIATOR_IP "sshfs -o\
 	 ssh_command=\"ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ControlMaster=auto\
@@ -167,15 +172,15 @@ function host_2_create_share()
 	ssh_remote $MGMT_INITIATOR_IP "sshfs -o\
 	 ssh_command=\"ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ControlMaster=auto\
 	 -i $SPDK_VHOST_SSH_KEY_FILE\" root@$MGMT_TARGET_IP:$share_dir $share_dir"
-	ssh_remote $MGMT_INITIATOR_IP "mkdir -p $share_dir/spdk"
-	ssh_remote $MGMT_INITIATOR_IP "tar -zxf $share_dir/spdk.tar.gz -C $share_dir/spdk --strip-components=1"
-	ssh_remote $MGMT_INITIATOR_IP "cd $share_dir/spdk; make clean; ./configure --with-rdma --enable-debug; make -j40"
+	ssh_remote $MGMT_INITIATOR_IP "mkdir -p $spdk_repo_share_dir/spdk"
+	ssh_remote $MGMT_INITIATOR_IP "tar -zxf $share_dir/spdk.tar.gz -C $spdk_repo_share_dir/spdk --strip-components=1"
+	ssh_remote $MGMT_INITIATOR_IP "cd $spdk_repo_share_dir/spdk; make clean; ./configure --with-rdma --enable-debug; make -j40"
 }
 
 function host_2_start_vhost()
 {
-	ssh_remote $MGMT_INITIATOR_IP "nohup $share_dir/spdk/test/vhost/migration/migration.sh\
-	 --test-cases=3b --work-dir=$TEST_DIR --os=$share_dir/migration.qcow2\
+	ssh_remote $MGMT_INITIATOR_IP "nohup $spdk_repo_share_dir/spdk/test/vhost/migration/migration.sh\
+	 --test-cases=3b --os=$share_dir/migration.qcow2\
 	 --rdma-tgt-ip=$RDMA_TARGET_IP &>$share_dir/output.log &"
 	notice "Waiting for remote to be done with vhost & VM setup..."
 	wait_for_remote

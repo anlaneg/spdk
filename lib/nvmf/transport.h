@@ -1,8 +1,8 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright (c) Intel Corporation.
- *   All rights reserved.
+ *   Copyright (c) Intel Corporation. All rights reserved.
+ *   Copyright (c) 2019 Mellanox Technologies LTD. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
  *   modification, are permitted provided that the following conditions
@@ -42,6 +42,10 @@
 struct spdk_nvmf_transport {
 	struct spdk_nvmf_tgt			*tgt;
 	const struct spdk_nvmf_transport_ops	*ops;
+	struct spdk_nvmf_transport_opts		opts;
+
+	/* A mempool for transport related data transfers */
+	struct spdk_mempool			*data_buf_pool;
 
 	TAILQ_ENTRY(spdk_nvmf_transport)	link;
 };
@@ -53,9 +57,14 @@ struct spdk_nvmf_transport_ops {
 	enum spdk_nvme_transport_type type;
 
 	/**
-	 * Create a transport for the given target
+	 * Initialize transport options to default value
 	 */
-	struct spdk_nvmf_transport *(*create)(struct spdk_nvmf_tgt *tgt);
+	void (*opts_init)(struct spdk_nvmf_transport_opts *opts);
+
+	/**
+	 * Create a transport for the given transport opts
+	 */
+	struct spdk_nvmf_transport *(*create)(struct spdk_nvmf_transport_opts *opts);
 
 	/**
 	 * Destroy the transport
@@ -78,7 +87,7 @@ struct spdk_nvmf_transport_ops {
 	/**
 	 * Check for new connections on the transport.
 	 */
-	void (*accept)(struct spdk_nvmf_transport *transport, new_qpair_fn cb_fn);
+	void (*accept)(struct spdk_nvmf_transport *transport, new_qpair_fn cb_fn, void *cb_arg);
 
 	/**
 	 * Fill out a discovery log entry for a specific listen address.
@@ -91,6 +100,11 @@ struct spdk_nvmf_transport_ops {
 	 * Create a new poll group
 	 */
 	struct spdk_nvmf_transport_poll_group *(*poll_group_create)(struct spdk_nvmf_transport *transport);
+
+	/**
+	 * Get the polling group of the queue pair optimal for the specific transport
+	 */
+	struct spdk_nvmf_transport_poll_group *(*get_optimal_poll_group)(struct spdk_nvmf_qpair *qpair);
 
 	/**
 	 * Destroy a poll group
@@ -115,6 +129,12 @@ struct spdk_nvmf_transport_ops {
 	int (*poll_group_poll)(struct spdk_nvmf_transport_poll_group *group);
 
 	/*
+	 * Free the request without sending a response
+	 * to the originator. Release memory tied to this request.
+	 */
+	int (*req_free)(struct spdk_nvmf_request *req);
+
+	/*
 	 * Signal request completion, which sends a response
 	 * to the originator.
 	 */
@@ -126,22 +146,45 @@ struct spdk_nvmf_transport_ops {
 	void (*qpair_fini)(struct spdk_nvmf_qpair *qpair);
 
 	/*
-	 * True if the qpair has no pending IO.
+	 * Get the peer transport ID for the queue pair.
 	 */
-	bool (*qpair_is_idle)(struct spdk_nvmf_qpair *qpair);
+	int (*qpair_get_peer_trid)(struct spdk_nvmf_qpair *qpair,
+				   struct spdk_nvme_transport_id *trid);
+
+	/*
+	 * Get the local transport ID for the queue pair.
+	 */
+	int (*qpair_get_local_trid)(struct spdk_nvmf_qpair *qpair,
+				    struct spdk_nvme_transport_id *trid);
+
+	/*
+	 * Get the listener transport ID that accepted this qpair originally.
+	 */
+	int (*qpair_get_listen_trid)(struct spdk_nvmf_qpair *qpair,
+				     struct spdk_nvme_transport_id *trid);
+
+	/*
+	 * set the submission queue size of the queue pair
+	 */
+	int (*qpair_set_sqsize)(struct spdk_nvmf_qpair *qpair);
+
+	/*
+	 * Get transport poll group statistics
+	 */
+	int (*poll_group_get_stat)(struct spdk_nvmf_tgt *tgt,
+				   struct spdk_nvmf_transport_poll_group_stat **stat);
+
+	/*
+	 * Free transport poll group statistics previously allocated with poll_group_get_stat()
+	 */
+	void (*poll_group_free_stat)(struct spdk_nvmf_transport_poll_group_stat *stat);
 };
-
-struct spdk_nvmf_transport *spdk_nvmf_transport_create(struct spdk_nvmf_tgt *tgt,
-		enum spdk_nvme_transport_type type);
-int spdk_nvmf_transport_destroy(struct spdk_nvmf_transport *transport);
-
-int spdk_nvmf_transport_listen(struct spdk_nvmf_transport *transport,
-			       const struct spdk_nvme_transport_id *trid);
 
 int spdk_nvmf_transport_stop_listen(struct spdk_nvmf_transport *transport,
 				    const struct spdk_nvme_transport_id *trid);
 
-void spdk_nvmf_transport_accept(struct spdk_nvmf_transport *transport, new_qpair_fn cb_fn);
+void spdk_nvmf_transport_accept(struct spdk_nvmf_transport *transport, new_qpair_fn cb_fn,
+				void *cb_arg);
 
 void spdk_nvmf_transport_listener_discover(struct spdk_nvmf_transport *transport,
 		struct spdk_nvme_transport_id *trid,
@@ -149,6 +192,8 @@ void spdk_nvmf_transport_listener_discover(struct spdk_nvmf_transport *transport
 
 struct spdk_nvmf_transport_poll_group *spdk_nvmf_transport_poll_group_create(
 	struct spdk_nvmf_transport *transport);
+struct spdk_nvmf_transport_poll_group *spdk_nvmf_transport_get_optimal_poll_group(
+	struct spdk_nvmf_transport *transport, struct spdk_nvmf_qpair *qpair);
 
 void spdk_nvmf_transport_poll_group_destroy(struct spdk_nvmf_transport_poll_group *group);
 
@@ -160,12 +205,27 @@ int spdk_nvmf_transport_poll_group_remove(struct spdk_nvmf_transport_poll_group 
 
 int spdk_nvmf_transport_poll_group_poll(struct spdk_nvmf_transport_poll_group *group);
 
+int spdk_nvmf_transport_req_free(struct spdk_nvmf_request *req);
+
 int spdk_nvmf_transport_req_complete(struct spdk_nvmf_request *req);
 
 void spdk_nvmf_transport_qpair_fini(struct spdk_nvmf_qpair *qpair);
 
-bool spdk_nvmf_transport_qpair_is_idle(struct spdk_nvmf_qpair *qpair);
+int spdk_nvmf_transport_qpair_get_peer_trid(struct spdk_nvmf_qpair *qpair,
+		struct spdk_nvme_transport_id *trid);
+
+int spdk_nvmf_transport_qpair_get_local_trid(struct spdk_nvmf_qpair *qpair,
+		struct spdk_nvme_transport_id *trid);
+
+int spdk_nvmf_transport_qpair_get_listen_trid(struct spdk_nvmf_qpair *qpair,
+		struct spdk_nvme_transport_id *trid);
+int spdk_nvmf_transport_qpair_set_sqsize(struct spdk_nvmf_qpair *qpair);
+
+bool spdk_nvmf_transport_opts_init(enum spdk_nvme_transport_type type,
+				   struct spdk_nvmf_transport_opts *opts);
 
 extern const struct spdk_nvmf_transport_ops spdk_nvmf_transport_rdma;
+extern const struct spdk_nvmf_transport_ops spdk_nvmf_transport_tcp;
+extern const struct spdk_nvmf_transport_ops spdk_nvmf_transport_fc;
 
 #endif /* SPDK_NVMF_TRANSPORT_H */

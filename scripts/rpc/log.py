@@ -1,30 +1,75 @@
-def set_trace_flag(client, args):
-    params = {'flag': args.flag}
-    return client.call('set_trace_flag', params)
+from .helpers import deprecated_alias
 
 
-def clear_trace_flag(client, args):
-    params = {'flag': args.flag}
-    return client.call('clear_trace_flag', params)
+@deprecated_alias('set_log_flag')
+def log_set_flag(client, flag):
+    """Set log flag.
+
+    Args:
+        flag: log flag we want to set. (for example "nvme")
+    """
+    params = {'flag': flag}
+    return client.call('log_set_flag', params)
 
 
-def get_trace_flags(client, args):
-    return client.call('get_trace_flags')
+@deprecated_alias('clear_log_flag')
+def log_clear_flag(client, flag):
+    """Clear log flag.
+
+    Args:
+        flag: log flag we want to clear. (for example "nvme")
+    """
+    params = {'flag': flag}
+    return client.call('log_clear_flag', params)
 
 
-def set_log_level(client, args):
-    params = {'level': args.level}
-    return client.call('set_log_level', params)
+@deprecated_alias('get_log_flags')
+def log_get_flags(client):
+    """Get log flags
+
+    Returns:
+        List of log flags
+    """
+    return client.call('log_get_flags')
 
 
-def get_log_level(client, args):
-    return client.call('get_log_level')
+@deprecated_alias('set_log_level')
+def log_set_level(client, level):
+    """Set log level.
+
+    Args:
+        level: log level we want to set. (for example "DEBUG")
+    """
+    params = {'level': level}
+    return client.call('log_set_level', params)
 
 
-def set_log_print_level(client, args):
-    params = {'level': args.level}
-    return client.call('set_log_print_level', params)
+@deprecated_alias('get_log_level')
+def log_get_level(client):
+    """Get log level
+
+    Returns:
+        Current log level
+    """
+    return client.call('log_get_level')
 
 
-def get_log_print_level(client, args):
-    return client.call('get_log_print_level')
+@deprecated_alias('set_log_print_level')
+def log_set_print_level(client, level):
+    """Set log print level.
+
+    Args:
+        level: log print level we want to set. (for example "DEBUG")
+    """
+    params = {'level': level}
+    return client.call('log_set_print_level', params)
+
+
+@deprecated_alias('get_log_print_level')
+def log_get_print_level(client):
+    """Get log print level
+
+    Returns:
+        Current log print level
+    """
+    return client.call('log_get_print_level')

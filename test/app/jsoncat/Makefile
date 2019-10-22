@@ -33,23 +33,11 @@
 
 SPDK_ROOT_DIR := $(abspath $(CURDIR)/../../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
-include $(SPDK_ROOT_DIR)/mk/spdk.app.mk
 
 APP = jsoncat
 
 C_SRCS = jsoncat.c
 
-SPDK_LIB_LIST = json thread util
+SPDK_LIB_LIST = json thread util log
 
-LIBS += $(SPDK_LIB_LINKER_ARGS)
-
-all: $(APP)
-	@:
-
-$(APP): $(OBJS) $(SPDK_LIB_FILES)
-	$(LINK_C)
-
-clean:
-	$(CLEAN_C) $(APP)
-
-include $(SPDK_ROOT_DIR)/mk/spdk.deps.mk
+include $(SPDK_ROOT_DIR)/mk/spdk.app.mk

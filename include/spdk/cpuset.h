@@ -50,7 +50,10 @@ extern "C" {
 /**
  * List of CPUs.
  */
-struct spdk_cpuset;
+struct spdk_cpuset {
+	char str[SPDK_CPUSET_SIZE / 4 + 1];
+	uint8_t cpus[SPDK_CPUSET_SIZE / 8];
+};
 
 /**
  * Allocate CPU set object.
@@ -99,6 +102,21 @@ void spdk_cpuset_and(struct spdk_cpuset *dst, const struct spdk_cpuset *src);
  * \param src Second argument of operation.
  */
 void spdk_cpuset_or(struct spdk_cpuset *dst, const struct spdk_cpuset *src);
+
+/**
+ * Perform XOR operation on two CPU sets. The result is stored in dst.
+ *
+ * \param dst First argument of operation. This value also stores the result of operation.
+ * \param src Second argument of operation.
+ */
+void spdk_cpuset_xor(struct spdk_cpuset *dst, const struct spdk_cpuset *src);
+
+/**
+ * Negate all CPUs in CPU set.
+ *
+ * \param set CPU set to be negated. This value also stores the result of operation.
+ */
+void spdk_cpuset_negate(struct spdk_cpuset *set);
 
 /**
  * Clear all CPUs in CPU set.

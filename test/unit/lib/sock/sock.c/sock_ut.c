@@ -66,7 +66,8 @@ struct spdk_ut_sock_group_impl {
 #define __ut_group(group) (struct spdk_ut_sock_group_impl *)group
 
 static int
-spdk_ut_sock_getaddr(struct spdk_sock *_sock, char *saddr, int slen, char *caddr, int clen)
+spdk_ut_sock_getaddr(struct spdk_sock *_sock, char *saddr, int slen, uint16_t *sport,
+		     char *caddr, int clen, uint16_t *cport)
 {
 	return 0;
 }
@@ -129,6 +130,7 @@ spdk_ut_sock_accept(struct spdk_sock *_sock)
 
 	SPDK_CU_ASSERT_FATAL(g_ut_client_sock != NULL);
 	g_ut_client_sock->peer = new_sock;
+	new_sock->peer = g_ut_client_sock;
 
 	return &new_sock->base;
 }
@@ -144,6 +146,12 @@ spdk_ut_sock_close(struct spdk_sock *_sock)
 	if (sock == g_ut_client_sock) {
 		g_ut_client_sock = NULL;
 	}
+
+	if (sock->peer != NULL) {
+		sock->peer->peer = NULL;
+	}
+
+	free(_sock);
 
 	return 0;
 }
@@ -162,6 +170,31 @@ spdk_ut_sock_recv(struct spdk_sock *_sock, void *buf, size_t len)
 	}
 
 	memcpy(buf, sock->buf, len);
+	memcpy(tmp, &sock->buf[len], sock->bytes_avail - len);
+	memcpy(sock->buf, tmp, sock->bytes_avail - len);
+	sock->bytes_avail -= len;
+
+	return len;
+}
+
+static ssize_t
+spdk_ut_sock_readv(struct spdk_sock *_sock, struct iovec *iov, int iovcnt)
+{
+	struct spdk_ut_sock *sock = __ut_sock(_sock);
+	size_t len;
+	char tmp[256];
+
+	/* Test implementation only supports single iov for now. */
+	CU_ASSERT(iovcnt == 1);
+
+	len = spdk_min(iov[0].iov_len, sock->bytes_avail);
+
+	if (len == 0) {
+		errno = EAGAIN;
+		return -1;
+	}
+
+	memcpy(iov[0].iov_base, sock->buf, len);
 	memcpy(tmp, &sock->buf[len], sock->bytes_avail - len);
 	memcpy(sock->buf, tmp, sock->bytes_avail - len);
 	sock->bytes_avail -= len;
@@ -215,6 +248,26 @@ static bool
 spdk_ut_sock_is_ipv4(struct spdk_sock *_sock)
 {
 	return true;
+}
+
+static bool
+spdk_ut_sock_is_connected(struct spdk_sock *_sock)
+{
+	struct spdk_ut_sock *sock = __ut_sock(_sock);
+
+	return (sock->peer != NULL);
+}
+
+static int
+spdk_ut_sock_get_placement_id(struct spdk_sock *_sock, int *placement_id)
+{
+	return -1;
+}
+
+static int
+spdk_ut_sock_set_priority(struct spdk_sock *_sock, int priority)
+{
+	return 0;
 }
 
 static struct spdk_sock_group_impl *
@@ -271,6 +324,7 @@ spdk_ut_sock_group_impl_close(struct spdk_sock_group_impl *_group)
 	struct spdk_ut_sock_group_impl *group = __ut_group(_group);
 
 	CU_ASSERT(group->sock == NULL);
+	free(_group);
 
 	return 0;
 }
@@ -283,12 +337,16 @@ static struct spdk_net_impl g_ut_net_impl = {
 	.accept		= spdk_ut_sock_accept,
 	.close		= spdk_ut_sock_close,
 	.recv		= spdk_ut_sock_recv,
+	.readv		= spdk_ut_sock_readv,
 	.writev		= spdk_ut_sock_writev,
 	.set_recvlowat	= spdk_ut_sock_set_recvlowat,
 	.set_recvbuf	= spdk_ut_sock_set_recvbuf,
 	.set_sendbuf	= spdk_ut_sock_set_sendbuf,
+	.set_priority	= spdk_ut_sock_set_priority,
 	.is_ipv6	= spdk_ut_sock_is_ipv6,
 	.is_ipv4	= spdk_ut_sock_is_ipv4,
+	.is_connected	= spdk_ut_sock_is_connected,
+	.get_placement_id	= spdk_ut_sock_get_placement_id,
 	.group_impl_create	= spdk_ut_sock_group_impl_create,
 	.group_impl_add_sock	= spdk_ut_sock_group_impl_add_sock,
 	.group_impl_remove_sock = spdk_ut_sock_group_impl_remove_sock,
@@ -328,7 +386,10 @@ _sock(const char *ip, int port)
 
 	server_sock = spdk_sock_accept(listen_sock);
 	SPDK_CU_ASSERT_FATAL(server_sock != NULL);
+	CU_ASSERT(spdk_sock_is_connected(client_sock) == true);
+	CU_ASSERT(spdk_sock_is_connected(server_sock) == true);
 
+	/* Test spdk_sock_recv */
 	iov.iov_base = test_string;
 	iov.iov_len = 7;
 	bytes_written = spdk_sock_writev(client_sock, &iov, 1);
@@ -346,9 +407,38 @@ _sock(const char *ip, int port)
 
 	CU_ASSERT(strncmp(test_string, buffer, 7) == 0);
 
+	/* Test spdk_sock_readv */
+	iov.iov_base = test_string;
+	iov.iov_len = 7;
+	bytes_written = spdk_sock_writev(client_sock, &iov, 1);
+	CU_ASSERT(bytes_written == 7);
+
+	usleep(1000);
+
+	iov.iov_base = buffer;
+	iov.iov_len = 2;
+	bytes_read = spdk_sock_readv(server_sock, &iov, 1);
+	CU_ASSERT(bytes_read == 2);
+
+	usleep(1000);
+
+	iov.iov_base = buffer + 2;
+	iov.iov_len = 5;
+	bytes_read += spdk_sock_readv(server_sock, &iov, 1);
+	CU_ASSERT(bytes_read == 7);
+
+	usleep(1000);
+
+	CU_ASSERT(strncmp(test_string, buffer, 7) == 0);
+
 	rc = spdk_sock_close(&client_sock);
 	CU_ASSERT(client_sock == NULL);
 	CU_ASSERT(rc == 0);
+
+	/* On FreeBSD, it takes a small amount of time for a close to propagate to the
+	 * other side, even in loopback. Introduce a small sleep. */
+	sleep(1);
+	CU_ASSERT(spdk_sock_is_connected(server_sock) == false);
 
 	rc = spdk_sock_close(&server_sock);
 	CU_ASSERT(server_sock == NULL);
@@ -362,7 +452,7 @@ _sock(const char *ip, int port)
 static void
 posix_sock(void)
 {
-	_sock("127.0.0.1", 3260);
+	_sock("127.0.0.1", UT_PORT);
 }
 
 static void
@@ -409,7 +499,7 @@ _sock_group(const char *ip, int port)
 	server_sock = spdk_sock_accept(listen_sock);
 	SPDK_CU_ASSERT_FATAL(server_sock != NULL);
 
-	group = spdk_sock_group_create();
+	group = spdk_sock_group_create(NULL);
 	SPDK_CU_ASSERT_FATAL(group != NULL);
 
 	/* pass null cb_fn */
@@ -443,7 +533,7 @@ _sock_group(const char *ip, int port)
 	g_bytes_read = 0;
 	rc = spdk_sock_group_poll(group);
 
-	CU_ASSERT(rc == 0);
+	CU_ASSERT(rc == 1);
 	CU_ASSERT(g_read_data_called == true);
 	CU_ASSERT(g_bytes_read == 7);
 
@@ -482,7 +572,7 @@ _sock_group(const char *ip, int port)
 static void
 posix_sock_group(void)
 {
-	_sock_group("127.0.0.1", 3260);
+	_sock_group("127.0.0.1", UT_PORT);
 }
 
 static void
@@ -518,14 +608,14 @@ posix_sock_group_fairness(void)
 	struct iovec iov;
 	int i, rc;
 
-	listen_sock = spdk_sock_listen("127.0.0.1", 3260);
+	listen_sock = spdk_sock_listen("127.0.0.1", UT_PORT);
 	SPDK_CU_ASSERT_FATAL(listen_sock != NULL);
 
-	group = spdk_sock_group_create();
+	group = spdk_sock_group_create(NULL);
 	SPDK_CU_ASSERT_FATAL(group != NULL);
 
 	for (i = 0; i < 3; i++) {
-		client_sock[i] = spdk_sock_connect("127.0.0.1", 3260);
+		client_sock[i] = spdk_sock_connect("127.0.0.1", UT_PORT);
 		SPDK_CU_ASSERT_FATAL(client_sock[i] != NULL);
 
 		usleep(1000);
@@ -554,7 +644,7 @@ posix_sock_group_fairness(void)
 	 */
 	g_server_sock_read = NULL;
 	rc = spdk_sock_group_poll_count(group, 1);
-	CU_ASSERT(rc == 0);
+	CU_ASSERT(rc == 1);
 	CU_ASSERT(g_server_sock_read == server_sock[0]);
 
 	/*
@@ -569,17 +659,17 @@ posix_sock_group_fairness(void)
 
 	g_server_sock_read = NULL;
 	rc = spdk_sock_group_poll_count(group, 1);
-	CU_ASSERT(rc == 0);
+	CU_ASSERT(rc == 1);
 	CU_ASSERT(g_server_sock_read == server_sock[1]);
 
 	g_server_sock_read = NULL;
 	rc = spdk_sock_group_poll_count(group, 1);
-	CU_ASSERT(rc == 0);
+	CU_ASSERT(rc == 1);
 	CU_ASSERT(g_server_sock_read == server_sock[2]);
 
 	g_server_sock_read = NULL;
 	rc = spdk_sock_group_poll_count(group, 1);
-	CU_ASSERT(rc == 0);
+	CU_ASSERT(rc == 1);
 	CU_ASSERT(g_server_sock_read == server_sock[0]);
 
 	for (i = 0; i < 3; i++) {

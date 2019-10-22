@@ -46,10 +46,23 @@ extern "C" {
 #endif
 
 /**
+ * for passing user-provided log call
+ *
+ * \param level Log level threshold.
+ * \param file Name of the current source file.
+ * \param line Current source file line.
+ * \param func Current source function name.
+ * \param format Format string to the message.
+ * \param args Additional arguments for format string.
+ */
+typedef void logfunc(int level, const char *file, const int line,
+		     const char *func, const char *format, va_list args);
+
+/**
  * Initialize the logging module. Messages prior
  * to this call will be dropped.
  */
-void spdk_log_open(void);
+void spdk_log_open(logfunc *logf);
 
 /**
  * Close the currently active log. Messages after this call
@@ -58,6 +71,8 @@ void spdk_log_open(void);
 void spdk_log_close(void);
 
 enum spdk_log_level {
+	/** All messages will be suppressed. */
+	SPDK_LOG_DISABLED = -1,
 	SPDK_LOG_ERROR,
 	SPDK_LOG_WARN,
 	SPDK_LOG_NOTICE,
@@ -81,9 +96,30 @@ void spdk_log_set_level(enum spdk_log_level level);
 enum spdk_log_level spdk_log_get_level(void);
 
 /**
+ * Set the log level threshold to include stack trace in log messages.
+ * Messages with a higher level than this will not contain stack trace. You
+ * can use \c SPDK_LOG_DISABLED to completely disable stack trace printing
+ * even if it is supported.
+ *
+ * \note This function has no effect if SPDK is built without stack trace
+ *  printing support.
+ *
+ * \param level Log level threshold for stacktrace.
+ */
+void spdk_log_set_backtrace_level(enum spdk_log_level level);
+
+/**
+ * Get the current log level threshold for showing stack trace in log message.
+ *
+ * \return the current log level threshold for stack trace.
+ */
+enum spdk_log_level spdk_log_get_backtrace_level(void);
+
+/**
  * Set the current log level threshold for printing to stderr.
  * Messages with a level less than or equal to this level
- * are also printed to stderr.
+ * are also printed to stderr. You can use \c SPDK_LOG_DISABLED to completely
+ * suppress log printing.
  *
  * \param level Log level threshold for printing to stderr.
  */
@@ -104,7 +140,8 @@ enum spdk_log_level spdk_log_get_print_level(void);
 	spdk_log(SPDK_LOG_ERROR, __FILE__, __LINE__, __func__, __VA_ARGS__)
 
 /**
- * Write messages to the log file.
+ * Write messages to the log file. If \c level is set to \c SPDK_LOG_DISABLED,
+ * this log message won't be written.
  *
  * \param level Log level threshold.
  * \param file Name of the current source file.
@@ -116,47 +153,47 @@ void spdk_log(enum spdk_log_level level, const char *file, const int line, const
 	      const char *format, ...) __attribute__((__format__(__printf__, 5, 6)));
 
 /**
- * Dump the trace to a file.
+ * Log the contents of a raw buffer to a file.
  *
- * \param fp File to hold the trace.
+ * \param fp File to hold the log.
  * \param label Label to print to the file.
- * \param buf Buffer that holds the trace information.
- * \param len Length of trace to dump.
+ * \param buf Buffer that holds the log information.
+ * \param len Length of buffer to dump.
  */
-void spdk_trace_dump(FILE *fp, const char *label, const void *buf, size_t len);
+void spdk_log_dump(FILE *fp, const char *label, const void *buf, size_t len);
 
 /**
- * Check whether the trace flag exists and is enabled.
+ * Check whether the log flag exists and is enabled.
  *
  * \return true if enabled, or false otherwise.
  */
-bool spdk_log_get_trace_flag(const char *flag);
+bool spdk_log_get_flag(const char *flag);
 
 /**
- * Enable the trace flag.
+ * Enable the log flag.
  *
- * \param flag Trace flag to be enabled.
+ * \param flag Log flag to be enabled.
  *
  * \return 0 on success, -1 on failure.
  */
-int spdk_log_set_trace_flag(const char *flag);
+int spdk_log_set_flag(const char *flag);
 
 /**
- * Clear a trace flag.
+ * Clear a log flag.
  *
- * \param flag Trace flag to clear.
+ * \param flag Log flag to clear.
  *
  * \return 0 on success, -1 on failure.
  */
-int spdk_log_clear_trace_flag(const char *flag);
+int spdk_log_clear_flag(const char *flag);
 
 /**
- * Show all the log trace flags and their usage.
+ * Show all the log flags and their usage.
  *
  * \param f File to hold all the flags' information.
- * \param trace_arg Command line option to set/enable the trace flag.
+ * \param log_arg Command line option to set/enable the log flag.
  */
-void spdk_tracelog_usage(FILE *f, const char *trace_arg);
+void spdk_log_usage(FILE *f, const char *log_arg);
 
 #ifdef __cplusplus
 }

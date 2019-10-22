@@ -52,6 +52,7 @@ struct hello_context_t {
 	struct spdk_io_channel *bdev_io_channel;
 	char *buff;
 	char *bdev_name;
+	struct spdk_bdev_io_wait_entry bdev_io_wait;
 };
 
 /*
@@ -60,19 +61,22 @@ struct hello_context_t {
 static void
 hello_bdev_usage(void)
 {
-	printf(" -b bdev name\n");
+	printf(" -b <bdev>                 name of the bdev to use\n");
 }
 
 /*
  * This function is called to parse the parameters that are specific to this application
  */
-static void hello_bdev_parse_arg(int ch, char *arg)
+static int hello_bdev_parse_arg(int ch, char *arg)
 {
 	switch (ch) {
 	case 'b':
 		g_bdev_name = arg;
 		break;
+	default:
+		return -EINVAL;
 	}
+	return 0;
 }
 
 /*
@@ -97,6 +101,33 @@ read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	spdk_app_stop(success ? 0 : -1);
 }
 
+static void
+hello_read(void *arg)
+{
+	struct hello_context_t *hello_context = arg;
+	int rc = 0;
+	uint32_t length = spdk_bdev_get_block_size(hello_context->bdev);
+
+	SPDK_NOTICELOG("Reading io\n");
+	rc = spdk_bdev_read(hello_context->bdev_desc, hello_context->bdev_io_channel,
+			    hello_context->buff, 0, length, read_complete, hello_context);
+
+	if (rc == -ENOMEM) {
+		SPDK_NOTICELOG("Queueing io\n");
+		/* In case we cannot perform I/O now, queue I/O */
+		hello_context->bdev_io_wait.bdev = hello_context->bdev;
+		hello_context->bdev_io_wait.cb_fn = hello_read;
+		hello_context->bdev_io_wait.cb_arg = hello_context;
+		spdk_bdev_queue_io_wait(hello_context->bdev, hello_context->bdev_io_channel,
+					&hello_context->bdev_io_wait);
+	} else if (rc) {
+		SPDK_ERRLOG("%s error while reading from bdev: %d\n", spdk_strerror(-rc), rc);
+		spdk_put_io_channel(hello_context->bdev_io_channel);
+		spdk_bdev_close(hello_context->bdev_desc);
+		spdk_app_stop(-1);
+	}
+}
+
 /*
  * Callback function for write io completion.
  */
@@ -104,8 +135,7 @@ static void
 write_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
 	struct hello_context_t *hello_context = cb_arg;
-	int rc;
-	uint32_t blk_size;
+	uint32_t length;
 
 	/* Complete the I/O */
 	spdk_bdev_free_io(bdev_io);
@@ -121,19 +151,36 @@ write_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	}
 
 	/* Zero the buffer so that we can use it for reading */
-	blk_size = spdk_bdev_get_block_size(hello_context->bdev);
-	memset(hello_context->buff, 0, blk_size);
+	length = spdk_bdev_get_block_size(hello_context->bdev);
+	memset(hello_context->buff, 0, length);
 
-	SPDK_NOTICELOG("Reading io\n");
-	rc = spdk_bdev_read(hello_context->bdev_desc, hello_context->bdev_io_channel,
-			    hello_context->buff, 0, blk_size, read_complete, hello_context);
+	hello_read(hello_context);
+}
 
-	if (rc) {
-		SPDK_ERRLOG("%s error while reading from bdev: %d\n", spdk_strerror(-rc), rc);
+static void
+hello_write(void *arg)
+{
+	struct hello_context_t *hello_context = arg;
+	int rc = 0;
+	uint32_t length = spdk_bdev_get_block_size(hello_context->bdev);
+
+	SPDK_NOTICELOG("Writing to the bdev\n");
+	rc = spdk_bdev_write(hello_context->bdev_desc, hello_context->bdev_io_channel,
+			     hello_context->buff, 0, length, write_complete, hello_context);
+
+	if (rc == -ENOMEM) {
+		SPDK_NOTICELOG("Queueing io\n");
+		/* In case we cannot perform I/O now, queue I/O */
+		hello_context->bdev_io_wait.bdev = hello_context->bdev;
+		hello_context->bdev_io_wait.cb_fn = hello_write;
+		hello_context->bdev_io_wait.cb_arg = hello_context;
+		spdk_bdev_queue_io_wait(hello_context->bdev, hello_context->bdev_io_channel,
+					&hello_context->bdev_io_wait);
+	} else if (rc) {
+		SPDK_ERRLOG("%s error while writing to bdev: %d\n", spdk_strerror(-rc), rc);
 		spdk_put_io_channel(hello_context->bdev_io_channel);
 		spdk_bdev_close(hello_context->bdev_desc);
 		spdk_app_stop(-1);
-		return;
 	}
 }
 
@@ -141,7 +188,7 @@ write_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
  * Our initial event that kicks off everything from main().
  */
 static void
-hello_start(void *arg1, void *arg2)
+hello_start(void *arg1)
 {
 	struct hello_context_t *hello_context = arg1;
 	uint32_t blk_size, buf_align;
@@ -200,16 +247,7 @@ hello_start(void *arg1, void *arg2)
 	}
 	snprintf(hello_context->buff, blk_size, "%s", "Hello World!\n");
 
-	SPDK_NOTICELOG("Writing to the bdev\n");
-	rc = spdk_bdev_write(hello_context->bdev_desc, hello_context->bdev_io_channel,
-			     hello_context->buff, 0, blk_size, write_complete, hello_context);
-	if (rc) {
-		SPDK_ERRLOG("%s error while writing to bdev: %d\n", spdk_strerror(-rc), rc);
-		spdk_bdev_close(hello_context->bdev_desc);
-		spdk_put_io_channel(hello_context->bdev_io_channel);
-		spdk_app_stop(-1);
-		return;
-	}
+	hello_write(hello_context);
 }
 
 int
@@ -222,7 +260,6 @@ main(int argc, char **argv)
 	/* Set default values in opts structure. */
 	spdk_app_opts_init(&opts);
 	opts.name = "hello_bdev";
-	opts.config_file = "bdev.conf";
 
 	/*
 	 * The user can provide the config file and bdev name at run time.
@@ -230,12 +267,16 @@ main(int argc, char **argv)
 	 * ./hello_bdev -c bdev.conf -b Malloc0
 	 * To use passthru bdev PT0 run with params
 	 * ./hello_bdev -c bdev.conf -b PT0
-	 * If none of the parameters are provide the application will use the
-	 * default parameters(-c bdev.conf -b Malloc0).
+	 * If the bdev name is not specified,
+	 * then Malloc0 is used by default
 	 */
-	if ((rc = spdk_app_parse_args(argc, argv, &opts, "b:", hello_bdev_parse_arg,
+	if ((rc = spdk_app_parse_args(argc, argv, &opts, "b:", NULL, hello_bdev_parse_arg,
 				      hello_bdev_usage)) != SPDK_APP_PARSE_ARGS_SUCCESS) {
 		exit(rc);
+	}
+	if (opts.config_file == NULL) {
+		SPDK_ERRLOG("configfile must be specified using -c <conffile> e.g. -c bdev.conf\n");
+		exit(1);
 	}
 	hello_context.bdev_name = g_bdev_name;
 
@@ -245,7 +286,7 @@ main(int argc, char **argv)
 	 * hello_start() returns), or if an error occurs during
 	 * spdk_app_start() before hello_start() runs.
 	 */
-	rc = spdk_app_start(&opts, hello_start, &hello_context, NULL);
+	rc = spdk_app_start(&opts, hello_start, &hello_context);
 	if (rc) {
 		SPDK_ERRLOG("ERROR starting application\n");
 	}

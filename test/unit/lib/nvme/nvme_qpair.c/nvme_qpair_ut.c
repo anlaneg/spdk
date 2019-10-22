@@ -49,42 +49,30 @@ struct nvme_driver _g_nvme_driver = {
 };
 
 void
-nvme_request_remove_child(struct nvme_request *parent,
-			  struct nvme_request *child)
+nvme_ctrlr_fail(struct spdk_nvme_ctrlr *ctrlr, bool hot_remove)
 {
-	parent->num_children--;
-	TAILQ_REMOVE(&parent->children, child, child_tailq);
+	if (hot_remove) {
+		ctrlr->is_removed = true;
+	}
+	ctrlr->is_failed = true;
 }
 
-int
-nvme_transport_qpair_enable(struct spdk_nvme_qpair *qpair)
+void
+nvme_transport_qpair_abort_reqs(struct spdk_nvme_qpair *qpair, uint32_t dnr)
 {
-	return 0;
-}
-
-int
-nvme_transport_qpair_disable(struct spdk_nvme_qpair *qpair)
-{
-	return 0;
-}
-
-int
-nvme_transport_qpair_fail(struct spdk_nvme_qpair *qpair)
-{
-	return 0;
 }
 
 int
 nvme_transport_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request *req)
 {
-	// TODO
+	/* TODO */
 	return 0;
 }
 
 int32_t
 nvme_transport_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_completions)
 {
-	// TODO
+	/* TODO */
 	return 0;
 }
 
@@ -102,6 +90,7 @@ prepare_submit_request_test(struct spdk_nvme_qpair *qpair,
 	ctrlr->free_io_qids = NULL;
 	TAILQ_INIT(&ctrlr->active_io_qpairs);
 	TAILQ_INIT(&ctrlr->active_procs);
+	MOCK_CLEAR(spdk_zmalloc);
 	nvme_qpair_init(qpair, 1, ctrlr, 0, 32);
 }
 
@@ -300,21 +289,31 @@ static void
 test_get_status_string(void)
 {
 	const char	*status_string;
+	struct spdk_nvme_status status;
 
-	status_string = get_status_string(SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS);
+	status.sct = SPDK_NVME_SCT_GENERIC;
+	status.sc = SPDK_NVME_SC_SUCCESS;
+	status_string = spdk_nvme_cpl_get_status_string(&status);
 	CU_ASSERT(strcmp(status_string, "SUCCESS") == 0);
 
-	status_string = get_status_string(SPDK_NVME_SCT_COMMAND_SPECIFIC,
-					  SPDK_NVME_SC_COMPLETION_QUEUE_INVALID);
+	status.sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+	status.sc = SPDK_NVME_SC_COMPLETION_QUEUE_INVALID;
+	status_string = spdk_nvme_cpl_get_status_string(&status);
 	CU_ASSERT(strcmp(status_string, "INVALID COMPLETION QUEUE") == 0);
 
-	status_string = get_status_string(SPDK_NVME_SCT_MEDIA_ERROR, SPDK_NVME_SC_UNRECOVERED_READ_ERROR);
+	status.sct = SPDK_NVME_SCT_MEDIA_ERROR;
+	status.sc = SPDK_NVME_SC_UNRECOVERED_READ_ERROR;
+	status_string = spdk_nvme_cpl_get_status_string(&status);
 	CU_ASSERT(strcmp(status_string, "UNRECOVERED READ ERROR") == 0);
 
-	status_string = get_status_string(SPDK_NVME_SCT_VENDOR_SPECIFIC, 0);
+	status.sct = SPDK_NVME_SCT_VENDOR_SPECIFIC;
+	status.sc = 0;
+	status_string = spdk_nvme_cpl_get_status_string(&status);
 	CU_ASSERT(strcmp(status_string, "VENDOR SPECIFIC") == 0);
 
-	status_string = get_status_string(100, 0);
+	status.sct = 0x4;
+	status.sc = 0;
+	status_string = spdk_nvme_cpl_get_status_string(&status);
 	CU_ASSERT(strcmp(status_string, "RESERVED") == 0);
 }
 #endif
@@ -330,6 +329,7 @@ test_nvme_qpair_add_cmd_error_injection(void)
 	ctrlr.adminq = &qpair;
 
 	/* Admin error injection at submission path */
+	MOCK_CLEAR(spdk_zmalloc);
 	rc = spdk_nvme_qpair_add_cmd_error_injection(&ctrlr, NULL,
 			SPDK_NVME_OPC_GET_FEATURES, true, 5000, 1,
 			SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_INVALID_FIELD);
@@ -379,6 +379,76 @@ test_nvme_qpair_add_cmd_error_injection(void)
 	cleanup_submit_request_test(&qpair);
 }
 
+static void
+test_nvme_qpair_submit_request(void)
+{
+	int				rc;
+	struct spdk_nvme_qpair		qpair = {};
+	struct spdk_nvme_ctrlr		ctrlr = {};
+	struct nvme_request		*req, *req1, *req2, *req3, *req2_1, *req2_2, *req2_3;
+
+	prepare_submit_request_test(&qpair, &ctrlr);
+
+	/*
+	 *  Build a request chain like the following:
+	 *            req
+	 *             |
+	 *      ---------------
+	 *     |       |       |
+	 *    req1    req2    req3
+	 *             |
+	 *      ---------------
+	 *     |       |       |
+	 *   req2_1  req2_2  req2_3
+	 */
+	req = nvme_allocate_request_null(&qpair, NULL, NULL);
+	CU_ASSERT(req != NULL);
+	TAILQ_INIT(&req->children);
+
+	req1 = nvme_allocate_request_null(&qpair, NULL, NULL);
+	CU_ASSERT(req1 != NULL);
+	req->num_children++;
+	TAILQ_INSERT_TAIL(&req->children, req1, child_tailq);
+	req1->parent = req;
+
+	req2 = nvme_allocate_request_null(&qpair, NULL, NULL);
+	CU_ASSERT(req2 != NULL);
+	TAILQ_INIT(&req2->children);
+	req->num_children++;
+	TAILQ_INSERT_TAIL(&req->children, req2, child_tailq);
+	req2->parent = req;
+
+	req3 = nvme_allocate_request_null(&qpair, NULL, NULL);
+	CU_ASSERT(req3 != NULL);
+	req->num_children++;
+	TAILQ_INSERT_TAIL(&req->children, req3, child_tailq);
+	req3->parent = req;
+
+	req2_1 = nvme_allocate_request_null(&qpair, NULL, NULL);
+	CU_ASSERT(req2_1 != NULL);
+	req2->num_children++;
+	TAILQ_INSERT_TAIL(&req2->children, req2_1, child_tailq);
+	req2_1->parent = req2;
+
+	req2_2 = nvme_allocate_request_null(&qpair, NULL, NULL);
+	CU_ASSERT(req2_2 != NULL);
+	req2->num_children++;
+	TAILQ_INSERT_TAIL(&req2->children, req2_2, child_tailq);
+	req2_2->parent = req2;
+
+	req2_3 = nvme_allocate_request_null(&qpair, NULL, NULL);
+	CU_ASSERT(req2_3 != NULL);
+	req2->num_children++;
+	TAILQ_INSERT_TAIL(&req2->children, req2_3, child_tailq);
+	req2_3->parent = req2;
+
+	ctrlr.is_failed = true;
+	rc = nvme_qpair_submit_request(&qpair, req);
+	SPDK_CU_ASSERT_FATAL(rc == -ENXIO);
+
+	cleanup_submit_request_test(&qpair);
+}
+
 int main(int argc, char **argv)
 {
 	CU_pSuite	suite = NULL;
@@ -405,6 +475,8 @@ int main(int argc, char **argv)
 #endif
 	    || CU_add_test(suite, "spdk_nvme_qpair_add_cmd_error_injection",
 			   test_nvme_qpair_add_cmd_error_injection) == NULL
+	    || CU_add_test(suite, "spdk_nvme_qpair_submit_request",
+			   test_nvme_qpair_submit_request) == NULL
 	   ) {
 		CU_cleanup_registry();
 		return CU_get_error();

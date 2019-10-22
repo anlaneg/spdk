@@ -34,7 +34,11 @@
 SPDK_ROOT_DIR := $(abspath $(CURDIR)/../../../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
-DIRS-y = request.c ctrlr.c subsystem.c ctrlr_discovery.c ctrlr_bdev.c
+DIRS-y = tcp.c ctrlr.c subsystem.c ctrlr_discovery.c ctrlr_bdev.c
+
+DIRS-$(CONFIG_RDMA) += rdma.c
+
+DIRS-$(CONFIG_FC) += fc.c fc_ls.c
 
 .PHONY: all clean $(DIRS-y)
 

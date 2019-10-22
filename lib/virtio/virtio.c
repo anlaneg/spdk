@@ -118,6 +118,7 @@ virtio_init_queue(struct virtio_dev *dev, uint16_t vtpci_queue_idx)
 {
 	unsigned int vq_size, size;
 	struct virtqueue *vq;
+	int rc;
 
 	SPDK_DEBUGLOG(SPDK_LOG_VIRTIO_DEV, "setting up queue: %"PRIu16"\n", vtpci_queue_idx);
 
@@ -138,15 +139,13 @@ virtio_init_queue(struct virtio_dev *dev, uint16_t vtpci_queue_idx)
 		return -EINVAL;
 	}
 
-	size = RTE_ALIGN_CEIL(sizeof(*vq) +
-			      vq_size * sizeof(struct vq_desc_extra),
-			      RTE_CACHE_LINE_SIZE);
+	size = sizeof(*vq) + vq_size * sizeof(struct vq_desc_extra);
 
-	vq = spdk_dma_zmalloc(size, RTE_CACHE_LINE_SIZE, NULL);
-	if (vq == NULL) {
+	if (posix_memalign((void **)&vq, RTE_CACHE_LINE_SIZE, size)) {
 		SPDK_ERRLOG("can not allocate vq\n");
 		return -ENOMEM;
 	}
+	memset(vq, 0, size);
 	dev->vqs[vtpci_queue_idx] = vq;
 
 	vq->vdev = dev;
@@ -163,9 +162,12 @@ virtio_init_queue(struct virtio_dev *dev, uint16_t vtpci_queue_idx)
 
 	vq->owner_thread = NULL;
 
-	if (virtio_dev_backend_ops(dev)->setup_queue(dev, vq) < 0) {
+	rc = virtio_dev_backend_ops(dev)->setup_queue(dev, vq);
+	if (rc < 0) {
 		SPDK_ERRLOG("setup_queue failed\n");
-		return -EINVAL;
+		free(vq);
+		dev->vqs[vtpci_queue_idx] = NULL;
+		return rc;
 	}
 
 	SPDK_DEBUGLOG(SPDK_LOG_VIRTIO_DEV, "vq->vq_ring_mem:      0x%" PRIx64 "\n",
@@ -196,11 +198,11 @@ virtio_free_queues(struct virtio_dev *dev)
 
 		virtio_dev_backend_ops(dev)->del_queue(dev, vq);
 
-		rte_free(vq);
+		free(vq);
 		dev->vqs[i] = NULL;
 	}
 
-	rte_free(dev->vqs);
+	free(dev->vqs);
 	dev->vqs = NULL;
 }
 
@@ -218,7 +220,7 @@ virtio_alloc_queues(struct virtio_dev *dev, uint16_t request_vq_num, uint16_t fi
 	}
 
 	assert(dev->vqs == NULL);
-	dev->vqs = rte_zmalloc(NULL, sizeof(struct virtqueue *) * nr_vq, 0);
+	dev->vqs = calloc(1, sizeof(struct virtqueue *) * nr_vq);
 	if (!dev->vqs) {
 		SPDK_ERRLOG("failed to allocate %"PRIu16" vqs\n", nr_vq);
 		return -ENOMEM;
@@ -253,7 +255,7 @@ virtio_negotiate_features(struct virtio_dev *dev, uint64_t req_features)
 	rc = virtio_dev_backend_ops(dev)->set_features(dev, req_features & host_features);
 	if (rc != 0) {
 		SPDK_ERRLOG("failed to negotiate device features.\n");
-		return -1;
+		return rc;
 	}
 
 	SPDK_DEBUGLOG(SPDK_LOG_VIRTIO_DEV, "negotiated features = %" PRIx64 "\n",
@@ -262,7 +264,10 @@ virtio_negotiate_features(struct virtio_dev *dev, uint64_t req_features)
 	virtio_dev_set_status(dev, VIRTIO_CONFIG_S_FEATURES_OK);
 	if (!(virtio_dev_get_status(dev) & VIRTIO_CONFIG_S_FEATURES_OK)) {
 		SPDK_ERRLOG("failed to set FEATURES_OK status!\n");
-		return -1;
+		/* either the device failed, or we offered some features that
+		 * depend on other, not offered features.
+		 */
+		return -EINVAL;
 	}
 
 	return 0;
@@ -301,13 +306,13 @@ virtio_dev_reset(struct virtio_dev *dev, uint64_t req_features)
 	virtio_dev_set_status(dev, VIRTIO_CONFIG_S_ACKNOWLEDGE);
 	if (!(virtio_dev_get_status(dev) & VIRTIO_CONFIG_S_ACKNOWLEDGE)) {
 		SPDK_ERRLOG("Failed to set VIRTIO_CONFIG_S_ACKNOWLEDGE status.\n");
-		return -1;
+		return -EIO;
 	}
 
 	virtio_dev_set_status(dev, VIRTIO_CONFIG_S_DRIVER);
 	if (!(virtio_dev_get_status(dev) & VIRTIO_CONFIG_S_DRIVER)) {
 		SPDK_ERRLOG("Failed to set VIRTIO_CONFIG_S_DRIVER status.\n");
-		return -1;
+		return -EIO;
 	}
 
 	return virtio_negotiate_features(dev, req_features);
@@ -379,7 +384,7 @@ virtqueue_dequeue_burst_rx(struct virtqueue *vq, void **rx_pkts,
 			   uint32_t *len, uint16_t num)
 {
 	struct vring_used_elem *uep;
-	struct virtio_req *cookie;
+	void *cookie;
 	uint16_t used_idx, desc_idx;
 	uint16_t i;
 
@@ -389,7 +394,7 @@ virtqueue_dequeue_burst_rx(struct virtqueue *vq, void **rx_pkts,
 		uep = &vq->vq_ring.used->ring[used_idx];
 		desc_idx = (uint16_t) uep->id;
 		len[i] = uep->len;
-		cookie = (struct virtio_req *)vq->vq_descx[desc_idx].cookie;
+		cookie = vq->vq_descx[desc_idx].cookie;
 
 		if (spdk_unlikely(cookie == NULL)) {
 			SPDK_WARNLOG("vring descriptor with no mbuf cookie at %"PRIu16"\n",
@@ -528,7 +533,7 @@ virtqueue_req_add_iovs(struct virtqueue *vq, struct iovec *iovs, uint16_t iovcnt
 		if (!vq->vdev->is_hw) {
 			desc->addr  = (uintptr_t)iovs[i].iov_base;
 		} else {
-			desc->addr = spdk_vtophys(iovs[i].iov_base);
+			desc->addr = spdk_vtophys(iovs[i].iov_base, NULL);
 		}
 
 		desc->len = iovs[i].iov_len;
@@ -546,11 +551,11 @@ virtqueue_req_add_iovs(struct virtqueue *vq, struct iovec *iovs, uint16_t iovcnt
 
 	vq->req_end = prev_head;
 	vq->vq_desc_head_idx = new_head;
+	vq->vq_free_cnt = (uint16_t)(vq->vq_free_cnt - iovcnt);
 	if (vq->vq_desc_head_idx == VQ_RING_DESC_CHAIN_END) {
 		assert(vq->vq_free_cnt == 0);
 		vq->vq_desc_tail_idx = VQ_RING_DESC_CHAIN_END;
 	}
-	vq->vq_free_cnt = (uint16_t)(vq->vq_free_cnt - iovcnt);
 }
 
 #define DESC_PER_CACHELINE (RTE_CACHE_LINE_SIZE / sizeof(struct vring_desc))
@@ -714,14 +719,12 @@ virtio_dev_backend_ops(struct virtio_dev *dev)
 void
 virtio_dev_dump_json_info(struct virtio_dev *hw, struct spdk_json_write_ctx *w)
 {
-	spdk_json_write_name(w, "virtio");
-	spdk_json_write_object_begin(w);
+	spdk_json_write_named_object_begin(w, "virtio");
 
-	spdk_json_write_name(w, "vq_count");
-	spdk_json_write_uint32(w, hw->max_queues);
+	spdk_json_write_named_uint32(w, "vq_count", hw->max_queues);
 
-	spdk_json_write_name(w, "vq_size");
-	spdk_json_write_uint32(w, virtio_dev_backend_ops(hw)->get_queue_size(hw, 0));
+	spdk_json_write_named_uint32(w, "vq_size",
+				     virtio_dev_backend_ops(hw)->get_queue_size(hw, 0));
 
 	virtio_dev_backend_ops(hw)->dump_json_info(hw, w);
 

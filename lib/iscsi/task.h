@@ -44,6 +44,10 @@ struct spdk_iscsi_task {
 
 	struct spdk_iscsi_task *parent;
 
+	uint8_t rsp_scsi_status;
+	uint8_t rsp_sense_data[32];
+	size_t rsp_sense_data_len;
+
 	struct spdk_iscsi_conn *conn;
 	struct spdk_iscsi_pdu *pdu;
 	uint32_t outstanding_r2t;
@@ -93,10 +97,13 @@ struct spdk_iscsi_task {
 	 */
 	int lun_id;
 
+	struct spdk_poller *mgmt_poller;
+
 	TAILQ_ENTRY(spdk_iscsi_task) link;
 
 	TAILQ_HEAD(subtask_list, spdk_iscsi_task) subtask_list;
 	TAILQ_ENTRY(spdk_iscsi_task) subtask_link;
+	bool is_queued; /* is queued in scsi layer for handling */
 };
 
 static inline void

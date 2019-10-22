@@ -82,10 +82,7 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	dev->ctrlr = ctrlr;
 	nsid = spdk_nvme_ctrlr_get_first_active_ns(ctrlr);
 	dev->ns = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
-	if (dev->ns == NULL) {
-		failed = 1;
-		return;
-	}
+
 	dev->qpair = spdk_nvme_ctrlr_alloc_io_qpair(ctrlr, NULL, 0);
 	if (dev->qpair == NULL) {
 		failed = 1;
@@ -158,7 +155,7 @@ read_test_cb(void *cb_arg, const struct spdk_nvme_cpl *cpl)
 	struct dev *dev = cb_arg;
 
 	outstanding_commands--;
-	spdk_dma_free(dev->data);
+	spdk_free(dev->data);
 
 	if (spdk_nvme_cpl_is_error(cpl) && dev->error_expected) {
 		if (cpl->status.sct != SPDK_NVME_SCT_MEDIA_ERROR ||
@@ -183,8 +180,12 @@ read_test(bool error_expected)
 	struct dev *dev;
 
 	foreach_dev(dev) {
+		if (dev->ns == NULL) {
+			continue;
+		}
+
 		dev->error_expected = error_expected;
-		dev->data = spdk_dma_zmalloc(0x1000, 0x1000, NULL);
+		dev->data = spdk_zmalloc(0x1000, 0x1000, NULL, SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
 		if (!dev->data) {
 			failed = 1;
 			goto cleanup;
@@ -219,7 +220,7 @@ int main(int argc, char **argv)
 	spdk_env_opts_init(&opts);
 	opts.name = "err_injection";
 	opts.core_mask = "0x1";
-	opts.mem_size = 64;
+	opts.shm_id = 0;
 	if (spdk_env_init(&opts) < 0) {
 		fprintf(stderr, "Unable to initialize SPDK env\n");
 		return 1;
@@ -234,6 +235,11 @@ int main(int argc, char **argv)
 
 	if (failed) {
 		goto exit;
+	}
+
+	if (!num_devs) {
+		printf("No NVMe controller found, %s exiting\n", argv[0]);
+		return 1;
 	}
 
 	foreach_dev(dev) {

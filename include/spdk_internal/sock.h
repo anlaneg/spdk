@@ -49,14 +49,16 @@ extern "C" {
 #define MAX_EVENTS_PER_POLL 32
 
 struct spdk_sock {
-	struct spdk_net_impl	*net_impl;
-	spdk_sock_cb		cb_fn;
-	void			*cb_arg;
-	TAILQ_ENTRY(spdk_sock)	link;
+	struct spdk_net_impl		*net_impl;
+	spdk_sock_cb			cb_fn;
+	void				*cb_arg;
+	struct spdk_sock_group_impl	*group_impl;
+	TAILQ_ENTRY(spdk_sock)		link;
 };
 
 struct spdk_sock_group {
 	STAILQ_HEAD(, spdk_sock_group_impl)	group_impls;
+	void					*ctx;
 };
 
 struct spdk_sock_group_impl {
@@ -68,21 +70,26 @@ struct spdk_sock_group_impl {
 struct spdk_net_impl {
 	const char *name;
 
-	int (*getaddr)(struct spdk_sock *sock, char *saddr, int slen, char *caddr, int clen);
+	int (*getaddr)(struct spdk_sock *sock, char *saddr, int slen, uint16_t *sport, char *caddr,
+		       int clen, uint16_t *cport);
 	struct spdk_sock *(*connect)(const char *ip, int port);
 	struct spdk_sock *(*listen)(const char *ip, int port);
 	struct spdk_sock *(*accept)(struct spdk_sock *sock);
 	int (*close)(struct spdk_sock *sock);
 	ssize_t (*recv)(struct spdk_sock *sock, void *buf, size_t len);
+	ssize_t (*readv)(struct spdk_sock *sock, struct iovec *iov, int iovcnt);
 	ssize_t (*writev)(struct spdk_sock *sock, struct iovec *iov, int iovcnt);
 
 	int (*set_recvlowat)(struct spdk_sock *sock, int nbytes);
 	int (*set_recvbuf)(struct spdk_sock *sock, int sz);
 	int (*set_sendbuf)(struct spdk_sock *sock, int sz);
+	int (*set_priority)(struct spdk_sock *sock, int priority);
 
 	bool (*is_ipv6)(struct spdk_sock *sock);
 	bool (*is_ipv4)(struct spdk_sock *sock);
+	bool (*is_connected)(struct spdk_sock *sock);
 
+	int (*get_placement_id)(struct spdk_sock *sock, int *placement_id);
 	struct spdk_sock_group_impl *(*group_impl_create)(void);
 	int (*group_impl_add_sock)(struct spdk_sock_group_impl *group, struct spdk_sock *sock);
 	int (*group_impl_remove_sock)(struct spdk_sock_group_impl *group, struct spdk_sock *sock);

@@ -78,3 +78,29 @@ FIO test, the performance is worse than SPDK perf (also using one CPU core) agai
 multiple jobs for FIO test, the performance of FIO is similiar with SPDK perf. After analyzing this phenomenon, we
 think that is caused by the FIO architecture. Mainly FIO can scale with multiple threads (i.e., using CPU cores),
 but it is not good to use one thread against many I/O devices.
+
+# End-to-end Data Protection (Optional)
+
+Running with PI setting, following settings steps are required.
+First, format device namespace with proper PI setting. For example:
+
+    nvme format /dev/nvme0n1 -l 1 -i 1 -p 0 -m 1
+
+In fio configure file, add PRACT and set PRCHK by flags(GUARD|REFTAG|APPTAG) properly. For example:
+
+    pi_act=0
+    pi_chk=GUARD
+
+Blocksize should be set as the sum of data and metadata. For example, if data blocksize is 512 Byte, host generated
+PI metadata is 8 Byte, then blocksize in fio configure file should be 520 Byte:
+
+    bs=520
+
+The storage device may use a block format that requires separate metadata (DIX). In this scenario, the fio_plugin
+will automatically allocate an extra 4KiB buffer per I/O to hold this metadata. For some cases, such as 512 byte
+blocks with 32 metadata bytes per block and a 128KiB I/O size, 4KiB isn't large enough. In this case, the
+`md_per_io_size` option may be specified to increase the size of the metadata buffer.
+
+Expose two options 'apptag' and 'apptag_mask', users can change them in the configuration file when using
+application tag and application tag mask in end-to-end data protection.  Application tag and application
+tag mask are set to 0x1234 and 0xFFFF by default.

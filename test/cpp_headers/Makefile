@@ -33,10 +33,15 @@
 
 SPDK_ROOT_DIR := $(abspath $(CURDIR)/../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
-include $(SPDK_ROOT_DIR)/mk/spdk.app.mk
 
 HEADERS := $(wildcard $(SPDK_ROOT_DIR)/include/spdk/*.h)
+
+# On Linux, queue_extras.h is pulled in with queue.h,
+# on FreeBSD, we want to ignore queue_extras.h entirely.
+HEADERS := $(filter-out $(SPDK_ROOT_DIR)/include/spdk/queue_extras.h,$(HEADERS))
 CXX_SRCS := $(patsubst %.h,%.cpp,$(notdir $(HEADERS)))
+
+install : all
 
 %.cpp: $(SPDK_ROOT_DIR)/include/spdk/%.h
 	$(Q)echo "  TEST_HEADER include/spdk/$(notdir $<)"; \
@@ -49,3 +54,6 @@ clean :
 	$(CLEAN_C) $(CXX_SRCS)
 
 include $(SPDK_ROOT_DIR)/mk/spdk.deps.mk
+
+uninstall:
+	@:

@@ -256,13 +256,13 @@ parse_args(int argc, char **argv)
 	while ((op = getopt(argc, argv, "c:ht:q:")) != -1) {
 		switch (op) {
 		case 't':
-			g_user_config.time_in_sec = atoi(optarg);
+			g_user_config.time_in_sec = spdk_strtol(optarg, 10);
 			break;
 		case 'c':
 			g_user_config.core_mask = optarg;
 			break;
 		case 'q':
-			g_user_config.queue_depth = atoi(optarg);
+			g_user_config.queue_depth = spdk_strtol(optarg, 10);
 			break;
 		case 'h':
 			usage(argv[0]);
@@ -272,7 +272,8 @@ parse_args(int argc, char **argv)
 			return 1;
 		}
 	}
-	if (!g_user_config.time_in_sec || !g_user_config.core_mask || !g_user_config.queue_depth) {
+	if (g_user_config.time_in_sec <= 0 || !g_user_config.core_mask ||
+	    g_user_config.queue_depth <= 0) {
 		usage(argv[0]);
 		return 1;
 	}
@@ -439,7 +440,8 @@ get_next_chan(void)
 	struct spdk_ioat_chan *chan;
 
 	if (g_next_device == NULL) {
-		fprintf(stderr, "Not enough ioat channels found. Check that ioatdma driver is unloaded.\n");
+		fprintf(stderr, "Not enough ioat channels found. Check that ioat channels are bound\n");
+		fprintf(stderr, "to uio_pci_generic or vfio-pci.  scripts/setup.sh can help with this.\n");
 		return NULL;
 	}
 

@@ -41,24 +41,7 @@
 
 pid_t g_spdk_nvme_pid;
 
-DEFINE_STUB(spdk_mem_register, int, (void *vaddr, size_t len), 0);
-DEFINE_STUB(spdk_mem_unregister, int, (void *vaddr, size_t len), 0);
-
-DEFINE_STUB(spdk_nvme_ctrlr_get_process,
-	    struct spdk_nvme_ctrlr_process *,
-	    (struct spdk_nvme_ctrlr *ctrlr, pid_t pid),
-	    NULL);
-
-DEFINE_STUB(spdk_nvme_ctrlr_get_current_process,
-	    struct spdk_nvme_ctrlr_process *,
-	    (struct spdk_nvme_ctrlr *ctrlr),
-	    NULL);
-
-DEFINE_STUB(spdk_nvme_wait_for_completion, int,
-	    (struct spdk_nvme_qpair *qpair,
-	     struct nvme_completion_poll_status *status), 0);
-
-struct spdk_trace_flag SPDK_LOG_NVME = {
+struct spdk_log_flag SPDK_LOG_NVME = {
 	.name = "nvme",
 	.enabled = false,
 };
@@ -67,8 +50,6 @@ static struct nvme_driver _g_nvme_driver = {
 	.lock = PTHREAD_MUTEX_INITIALIZER,
 };
 struct nvme_driver *g_spdk_nvme_driver = &_g_nvme_driver;
-
-int32_t spdk_nvme_retry_count = 1;
 
 struct nvme_request *g_request = NULL;
 
@@ -122,14 +103,14 @@ nvme_qpair_deinit(struct spdk_nvme_qpair *qpair)
 }
 
 int
-spdk_pci_nvme_enumerate(spdk_pci_enum_cb enum_cb, void *enum_ctx)
+spdk_pci_enumerate(struct spdk_pci_driver *driver, spdk_pci_enum_cb enum_cb, void *enum_ctx)
 {
 	abort();
 }
 
 int
-spdk_pci_nvme_device_attach(spdk_pci_enum_cb enum_cb, void *enum_ctx,
-			    struct spdk_pci_addr *pci_address)
+spdk_pci_device_attach(struct spdk_pci_driver *driver, spdk_pci_enum_cb enum_cb, void *enum_ctx,
+		       struct spdk_pci_addr *pci_address)
 {
 	abort();
 }
@@ -172,7 +153,13 @@ spdk_pci_device_cfg_write32(struct spdk_pci_device *dev, uint32_t value, uint32_
 }
 
 int
-spdk_pci_device_claim(const struct spdk_pci_addr *pci_addr)
+spdk_pci_device_claim(struct spdk_pci_device *dev)
+{
+	abort();
+}
+
+void
+spdk_pci_device_unclaim(struct spdk_pci_device *dev)
 {
 	abort();
 }
@@ -214,8 +201,8 @@ nvme_ctrlr_proc_get_devhandle(struct spdk_nvme_ctrlr *ctrlr)
 }
 
 int
-nvme_ctrlr_probe(const struct spdk_nvme_transport_id *trid, void *devhandle,
-		 spdk_nvme_probe_cb probe_cb, void *cb_ctx)
+nvme_ctrlr_probe(const struct spdk_nvme_transport_id *trid,
+		 struct spdk_nvme_probe_ctx *probe_ctx, void *devhandle)
 {
 	abort();
 }
@@ -252,13 +239,13 @@ nvme_completion_is_retry(const struct spdk_nvme_cpl *cpl)
 }
 
 void
-nvme_qpair_print_command(struct spdk_nvme_qpair *qpair, struct spdk_nvme_cmd *cmd)
+spdk_nvme_qpair_print_command(struct spdk_nvme_qpair *qpair, struct spdk_nvme_cmd *cmd)
 {
 	abort();
 }
 
 void
-nvme_qpair_print_completion(struct spdk_nvme_qpair *qpair, struct spdk_nvme_cpl *cpl)
+spdk_nvme_qpair_print_completion(struct spdk_nvme_qpair *qpair, struct spdk_nvme_cpl *cpl)
 {
 	abort();
 }
@@ -486,7 +473,6 @@ test_sgl_req(void)
 	req->cmd.opc = SPDK_NVME_OPC_WRITE;
 	req->cmd.cdw10 = 10000;
 	req->cmd.cdw12 = 7 | 0;
-	spdk_nvme_retry_count = 1;
 	fail_next_sge = true;
 
 	CU_ASSERT(nvme_qpair_submit_request(&qpair, req) != 0);
@@ -590,7 +576,7 @@ test_hw_sgl_req(void)
 	nvme_free_request(req);
 }
 
-static void test_nvme_qpair_fail(void)
+static void test_nvme_qpair_abort_reqs(void)
 {
 	struct spdk_nvme_qpair		qpair = {};
 	struct nvme_request		*req = NULL;
@@ -607,14 +593,14 @@ static void test_nvme_qpair_fail(void)
 	tr_temp->req->cmd.cid = tr_temp->cid;
 
 	TAILQ_INSERT_HEAD(&qpair.outstanding_tr, tr_temp, tq_list);
-	nvme_qpair_fail(&qpair);
+	nvme_qpair_abort_reqs(&qpair, true);
 	CU_ASSERT_TRUE(TAILQ_EMPTY(&qpair.outstanding_tr));
 
 	req = nvme_allocate_request_null(expected_failure_callback, NULL);
 	SPDK_CU_ASSERT_FATAL(req != NULL);
 
 	STAILQ_INSERT_HEAD(&qpair.queued_req, req, stailq);
-	nvme_qpair_fail(&qpair);
+	nvme_qpair_abort_reqs(&qpair, true);
 	CU_ASSERT_TRUE(STAILQ_EMPTY(&qpair.queued_req));
 
 	cleanup_submit_request_test(&qpair);
@@ -791,10 +777,10 @@ test_prp_list_append(void)
 	CU_ASSERT(prp_index == 2);
 
 	/* 4K buffer, 4K aligned, but vtophys fails */
-	ut_fail_vtophys = true;
+	MOCK_SET(spdk_vtophys, SPDK_VTOPHYS_ERROR);
 	prp_list_prep(&tr, &req, &prp_index);
 	CU_ASSERT(nvme_pcie_prp_list_append(&tr, &prp_index, (void *)0x100000, 0x1000, 0x1000) == -EINVAL);
-	ut_fail_vtophys = false;
+	MOCK_CLEAR(spdk_vtophys);
 
 	/* Largest aligned buffer that can be described in NVME_MAX_PRP_LIST_ENTRIES (plus PRP1) */
 	prp_list_prep(&tr, &req, &prp_index);

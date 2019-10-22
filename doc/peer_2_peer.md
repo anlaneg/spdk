@@ -31,13 +31,23 @@ Key Functions                               | Description
 ------------------------------------------- | -----------
 spdk_nvme_ctrlr_alloc_cmb_io_buffer()       | @copybrief spdk_nvme_ctrlr_alloc_cmb_io_buffer()
 spdk_nvme_ctrlr_free_cmb_io_buffer()        | @copybrief spdk_nvme_ctrlr_free_cmb_io_buffer()
+spdk_nvme_ctrlr_get_regs_cmbsz()            | @copybrief spdk_nvme_ctrlr_get_regs_cmbsz()
+
+# Determining device support {#p2p_support}
+
+SPDK's identify example application displays whether a device has a controller
+memory buffer and which operations it supports. Run it as follows:
+
+~~~{.sh}
+./examples/nvme/identify/identify -r traddr:<pci id of ssd>
+~~~
 
 # cmb_copy: An example P2P Application {#p2p_cmb_copy}
 
 Run the cmb_copy example application.
 
 ~~~{.sh}
-./examples/nvme/cmb_copy -r <pci id of write ssd>-1-0-1 -w <pci id of write ssd>-1-0-1 -c <pci id of the ssd with cmb>
+./examples/nvme/cmb_copy/cmb_copy -r <pci id of write ssd>-1-0-1 -w <pci id of write ssd>-1-0-1 -c <pci id of the ssd with cmb>
 ~~~
 This should copy a single LBA (LBA 0) from namespace 1 on the read
 NVMe SSD to LBA 0 on namespace 1 on the write SSD using the CMB as the
@@ -52,7 +62,7 @@ DMA buffer.
   provided by Broadcom or Microsemi) as that is know to provide good
   performance.
 * Even with a PCIe switch there may be occasions where peer-2-peer
-  DMAs fail to work. This is probaby due to PCIe Access Control
+  DMAs fail to work. This is probably due to PCIe Access Control
   Services (ACS) being enabled by the BIOS and/or OS. You can disable
   ACS using setpci or via out of tree kernel patches that can be found
   on the internet.

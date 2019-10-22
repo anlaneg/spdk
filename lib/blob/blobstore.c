@@ -40,6 +40,7 @@
 #include "spdk/thread.h"
 #include "spdk/bit_array.h"
 #include "spdk/likely.h"
+#include "spdk/util.h"
 
 #include "spdk_internal/assert.h"
 #include "spdk_internal/log.h"
@@ -68,10 +69,18 @@ _spdk_blob_verify_md_op(struct spdk_blob *blob)
 	assert(blob->state != SPDK_BLOB_STATE_LOADING);
 }
 
-static inline size_t
-divide_round_up(size_t num, size_t divisor)
+static struct spdk_blob_list *
+_spdk_bs_get_snapshot_entry(struct spdk_blob_store *bs, spdk_blob_id blobid)
 {
-	return (num + divisor - 1) / divisor;
+	struct spdk_blob_list *snapshot_entry = NULL;
+
+	TAILQ_FOREACH(snapshot_entry, &bs->snapshots, link) {
+		if (snapshot_entry->id == blobid) {
+			break;
+		}
+	}
+
+	return snapshot_entry;
 }
 
 static void
@@ -109,7 +118,7 @@ _spdk_bs_allocate_cluster(struct spdk_blob *blob, uint32_t cluster_num,
 	pthread_mutex_lock(&blob->bs->used_clusters_mutex);
 	*lowest_free_cluster = spdk_bit_array_find_first_clear(blob->bs->used_clusters,
 			       *lowest_free_cluster);
-	if (*lowest_free_cluster >= blob->bs->total_clusters) {
+	if (*lowest_free_cluster == UINT32_MAX) {
 		/* No more free clusters. Cannot satisfy the request */
 		pthread_mutex_unlock(&blob->bs->used_clusters_mutex);
 		return -ENOSPC;
@@ -156,6 +165,12 @@ spdk_blob_opts_init(struct spdk_blob_opts *opts)
 	opts->num_clusters = 0;
 	opts->thin_provision = false;
 	_spdk_blob_xattrs_init(&opts->xattrs);
+}
+
+void
+spdk_blob_open_opts_init(struct spdk_blob_open_opts *opts)
+{
+	opts->clear_method = BLOB_CLEAR_WITH_UNMAP;
 }
 
 static struct spdk_blob *
@@ -459,23 +474,25 @@ _spdk_blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *bl
 			blob->data_ro_flags = desc_flags->data_ro_flags;
 			blob->md_ro_flags = desc_flags->md_ro_flags;
 
-		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_EXTENT) {
-			struct spdk_blob_md_descriptor_extent	*desc_extent;
+		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_EXTENT_RLE) {
+			struct spdk_blob_md_descriptor_extent_rle	*desc_extent_rle;
 			unsigned int				i, j;
 			unsigned int				cluster_count = blob->active.num_clusters;
 
-			desc_extent = (struct spdk_blob_md_descriptor_extent *)desc;
+			desc_extent_rle = (struct spdk_blob_md_descriptor_extent_rle *)desc;
 
-			if (desc_extent->length == 0 ||
-			    (desc_extent->length % sizeof(desc_extent->extents[0]) != 0)) {
+			if (desc_extent_rle->length == 0 ||
+			    (desc_extent_rle->length % sizeof(desc_extent_rle->extents[0]) != 0)) {
 				return -EINVAL;
 			}
 
-			for (i = 0; i < desc_extent->length / sizeof(desc_extent->extents[0]); i++) {
-				for (j = 0; j < desc_extent->extents[i].length; j++) {
-					if (!spdk_bit_array_get(blob->bs->used_clusters,
-								desc_extent->extents[i].cluster_idx + j)) {
-						return -EINVAL;
+			for (i = 0; i < desc_extent_rle->length / sizeof(desc_extent_rle->extents[0]); i++) {
+				for (j = 0; j < desc_extent_rle->extents[i].length; j++) {
+					if (desc_extent_rle->extents[i].cluster_idx != 0) {
+						if (!spdk_bit_array_get(blob->bs->used_clusters,
+									desc_extent_rle->extents[i].cluster_idx + j)) {
+							return -EINVAL;
+						}
 					}
 					cluster_count++;
 				}
@@ -491,11 +508,11 @@ _spdk_blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *bl
 			blob->active.clusters = tmp;
 			blob->active.cluster_array_size = cluster_count;
 
-			for (i = 0; i < desc_extent->length / sizeof(desc_extent->extents[0]); i++) {
-				for (j = 0; j < desc_extent->extents[i].length; j++) {
-					if (desc_extent->extents[i].cluster_idx != 0) {
+			for (i = 0; i < desc_extent_rle->length / sizeof(desc_extent_rle->extents[0]); i++) {
+				for (j = 0; j < desc_extent_rle->extents[i].length; j++) {
+					if (desc_extent_rle->extents[i].cluster_idx != 0) {
 						blob->active.clusters[blob->active.num_clusters++] = _spdk_bs_cluster_to_lba(blob->bs,
-								desc_extent->extents[i].cluster_idx + j);
+								desc_extent_rle->extents[i].cluster_idx + j);
 					} else if (spdk_blob_is_thin_provisioned(blob)) {
 						blob->active.clusters[blob->active.num_clusters++] = 0;
 					} else {
@@ -592,16 +609,14 @@ _spdk_blob_serialize_add_page(const struct spdk_blob *blob,
 	if (*page_count == 0) {
 		assert(*pages == NULL);
 		*page_count = 1;
-		*pages = spdk_dma_malloc(SPDK_BS_PAGE_SIZE,
-					 SPDK_BS_PAGE_SIZE,
-					 NULL);
+		*pages = spdk_malloc(SPDK_BS_PAGE_SIZE, SPDK_BS_PAGE_SIZE,
+				     NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 	} else {
 		assert(*pages != NULL);
 		(*page_count)++;
-		*pages = spdk_dma_realloc(*pages,
-					  SPDK_BS_PAGE_SIZE * (*page_count),
-					  SPDK_BS_PAGE_SIZE,
-					  NULL);
+		*pages = spdk_realloc(*pages,
+				      SPDK_BS_PAGE_SIZE * (*page_count),
+				      SPDK_BS_PAGE_SIZE);
 	}
 
 	if (*pages == NULL) {
@@ -658,24 +673,24 @@ _spdk_blob_serialize_xattr(const struct spdk_xattr *xattr,
 }
 
 static void
-_spdk_blob_serialize_extent(const struct spdk_blob *blob,
-			    uint64_t start_cluster, uint64_t *next_cluster,
-			    uint8_t *buf, size_t buf_sz)
+_spdk_blob_serialize_extent_rle(const struct spdk_blob *blob,
+				uint64_t start_cluster, uint64_t *next_cluster,
+				uint8_t **buf, size_t *buf_sz)
 {
-	struct spdk_blob_md_descriptor_extent *desc;
+	struct spdk_blob_md_descriptor_extent_rle *desc_extent_rle;
 	size_t cur_sz;
 	uint64_t i, extent_idx;
 	uint64_t lba, lba_per_cluster, lba_count;
 
 	/* The buffer must have room for at least one extent */
-	cur_sz = sizeof(struct spdk_blob_md_descriptor) + sizeof(desc->extents[0]);
-	if (buf_sz < cur_sz) {
+	cur_sz = sizeof(struct spdk_blob_md_descriptor) + sizeof(desc_extent_rle->extents[0]);
+	if (*buf_sz < cur_sz) {
 		*next_cluster = start_cluster;
 		return;
 	}
 
-	desc = (struct spdk_blob_md_descriptor_extent *)buf;
-	desc->type = SPDK_MD_DESCRIPTOR_TYPE_EXTENT;
+	desc_extent_rle = (struct spdk_blob_md_descriptor_extent_rle *)*buf;
+	desc_extent_rle->type = SPDK_MD_DESCRIPTOR_TYPE_EXTENT_RLE;
 
 	lba_per_cluster = _spdk_bs_cluster_to_lba(blob->bs, 1);
 
@@ -686,32 +701,68 @@ _spdk_blob_serialize_extent(const struct spdk_blob *blob,
 		if ((lba + lba_count) == blob->active.clusters[i]) {
 			lba_count += lba_per_cluster;
 			continue;
+		} else if (lba == 0 && blob->active.clusters[i] == 0) {
+			lba_count += lba_per_cluster;
+			continue;
 		}
-		desc->extents[extent_idx].cluster_idx = lba / lba_per_cluster;
-		desc->extents[extent_idx].length = lba_count / lba_per_cluster;
+		desc_extent_rle->extents[extent_idx].cluster_idx = lba / lba_per_cluster;
+		desc_extent_rle->extents[extent_idx].length = lba_count / lba_per_cluster;
 		extent_idx++;
 
-		cur_sz += sizeof(desc->extents[extent_idx]);
+		cur_sz += sizeof(desc_extent_rle->extents[extent_idx]);
 
-		if (buf_sz < cur_sz) {
+		if (*buf_sz < cur_sz) {
 			/* If we ran out of buffer space, return */
-			desc->length = sizeof(desc->extents[0]) * extent_idx;
 			*next_cluster = i;
-			return;
+			goto finish;
 		}
 
 		lba = blob->active.clusters[i];
 		lba_count = lba_per_cluster;
 	}
 
-	desc->extents[extent_idx].cluster_idx = lba / lba_per_cluster;
-	desc->extents[extent_idx].length = lba_count / lba_per_cluster;
+	desc_extent_rle->extents[extent_idx].cluster_idx = lba / lba_per_cluster;
+	desc_extent_rle->extents[extent_idx].length = lba_count / lba_per_cluster;
 	extent_idx++;
 
-	desc->length = sizeof(desc->extents[0]) * extent_idx;
 	*next_cluster = blob->active.num_clusters;
 
+finish:
+	desc_extent_rle->length = sizeof(desc_extent_rle->extents[0]) * extent_idx;
+	*buf_sz -= sizeof(struct spdk_blob_md_descriptor) + desc_extent_rle->length;
+	*buf += sizeof(struct spdk_blob_md_descriptor) + desc_extent_rle->length;
+
 	return;
+}
+
+static int
+_spdk_blob_serialize_extents_rle(const struct spdk_blob *blob,
+				 struct spdk_blob_md_page **pages,
+				 struct spdk_blob_md_page *cur_page,
+				 uint32_t *page_count, uint8_t **buf,
+				 size_t *remaining_sz)
+{
+	uint64_t				last_cluster;
+	int					rc;
+
+	last_cluster = 0;
+	while (last_cluster < blob->active.num_clusters) {
+		_spdk_blob_serialize_extent_rle(blob, last_cluster, &last_cluster, buf, remaining_sz);
+
+		if (last_cluster == blob->active.num_clusters) {
+			break;
+		}
+
+		rc = _spdk_blob_serialize_add_page(blob, pages, page_count, &cur_page);
+		if (rc < 0) {
+			return rc;
+		}
+
+		*buf = (uint8_t *)cur_page->descriptors;
+		*remaining_sz = sizeof(cur_page->descriptors);
+	}
+
+	return 0;
 }
 
 static void
@@ -758,7 +809,7 @@ _spdk_blob_serialize_xattrs(const struct spdk_blob *blob,
 			rc = _spdk_blob_serialize_add_page(blob, pages, page_count,
 							   &cur_page);
 			if (rc < 0) {
-				spdk_dma_free(*pages);
+				spdk_free(*pages);
 				*pages = NULL;
 				*page_count = 0;
 				return rc;
@@ -774,7 +825,7 @@ _spdk_blob_serialize_xattrs(const struct spdk_blob *blob,
 							&required_sz, internal);
 
 			if (rc < 0) {
-				spdk_dma_free(*pages);
+				spdk_free(*pages);
 				*pages = NULL;
 				*page_count = 0;
 				return rc;
@@ -796,7 +847,6 @@ _spdk_blob_serialize(const struct spdk_blob *blob, struct spdk_blob_md_page **pa
 	int					rc;
 	uint8_t					*buf;
 	size_t					remaining_sz;
-	uint64_t				last_cluster;
 
 	assert(pages != NULL);
 	assert(page_count != NULL);
@@ -834,26 +884,9 @@ _spdk_blob_serialize(const struct spdk_blob *blob, struct spdk_blob_md_page **pa
 	}
 
 	/* Serialize extents */
-	last_cluster = 0;
-	while (last_cluster < blob->active.num_clusters) {
-		_spdk_blob_serialize_extent(blob, last_cluster, &last_cluster,
-					    buf, remaining_sz);
+	rc = _spdk_blob_serialize_extents_rle(blob, pages, cur_page, page_count, &buf, &remaining_sz);
 
-		if (last_cluster == blob->active.num_clusters) {
-			break;
-		}
-
-		rc = _spdk_blob_serialize_add_page(blob, pages, page_count,
-						   &cur_page);
-		if (rc < 0) {
-			return rc;
-		}
-
-		buf = (uint8_t *)cur_page->descriptors;
-		remaining_sz = sizeof(cur_page->descriptors);
-	}
-
-	return 0;
+	return rc;
 }
 
 struct spdk_blob_load_ctx {
@@ -891,7 +924,7 @@ _spdk_blob_load_final(void *cb_arg, int bserrno)
 	ctx->cb_fn(ctx->seq, ctx->cb_arg, bserrno);
 
 	/* Free the memory */
-	spdk_dma_free(ctx->pages);
+	spdk_free(ctx->pages);
 	free(ctx);
 }
 
@@ -919,7 +952,7 @@ error:
 	SPDK_ERRLOG("Snapshot fail\n");
 	_spdk_blob_free(blob);
 	ctx->cb_fn(ctx->seq, NULL, bserrno);
-	spdk_dma_free(ctx->pages);
+	spdk_free(ctx->pages);
 	free(ctx);
 }
 
@@ -934,13 +967,22 @@ _spdk_blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	int				rc;
 	uint32_t			crc;
 
+	if (bserrno) {
+		SPDK_ERRLOG("Metadata page read failed: %d\n", bserrno);
+		_spdk_blob_free(blob);
+		ctx->cb_fn(seq, NULL, bserrno);
+		spdk_free(ctx->pages);
+		free(ctx);
+		return;
+	}
+
 	page = &ctx->pages[ctx->num_pages - 1];
 	crc = _spdk_blob_md_page_calc_crc(page);
 	if (crc != page->crc) {
 		SPDK_ERRLOG("Metadata page %d crc mismatch\n", ctx->num_pages);
 		_spdk_blob_free(blob);
 		ctx->cb_fn(seq, NULL, -EINVAL);
-		spdk_dma_free(ctx->pages);
+		spdk_free(ctx->pages);
 		free(ctx);
 		return;
 	}
@@ -948,14 +990,16 @@ _spdk_blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	if (page->next != SPDK_INVALID_MD_PAGE) {
 		uint32_t next_page = page->next;
 		uint64_t next_lba = _spdk_bs_page_to_lba(blob->bs, blob->bs->md_start + next_page);
+		uint64_t max_md_lba = _spdk_bs_page_to_lba(blob->bs, blob->bs->md_start + blob->bs->md_len);
 
-
-		assert(next_lba < (blob->bs->md_start + blob->bs->md_len));
+		if (next_lba >= max_md_lba) {
+			assert(false);
+		}
 
 		/* Read the next page */
 		ctx->num_pages++;
-		ctx->pages = spdk_dma_realloc(ctx->pages, (sizeof(*page) * ctx->num_pages),
-					      sizeof(*page), NULL);
+		ctx->pages = spdk_realloc(ctx->pages, (sizeof(*page) * ctx->num_pages),
+					  sizeof(*page));
 		if (ctx->pages == NULL) {
 			ctx->cb_fn(seq, ctx->cb_arg, -ENOMEM);
 			free(ctx);
@@ -974,7 +1018,7 @@ _spdk_blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	if (rc) {
 		_spdk_blob_free(blob);
 		ctx->cb_fn(seq, NULL, rc);
-		spdk_dma_free(ctx->pages);
+		spdk_free(ctx->pages);
 		free(ctx);
 		return;
 	}
@@ -987,7 +1031,7 @@ _spdk_blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 			if (len != sizeof(spdk_blob_id)) {
 				_spdk_blob_free(blob);
 				ctx->cb_fn(seq, NULL, -EINVAL);
-				spdk_dma_free(ctx->pages);
+				spdk_free(ctx->pages);
 				free(ctx);
 				return;
 			}
@@ -1028,8 +1072,7 @@ _spdk_blob_load(spdk_bs_sequence_t *seq, struct spdk_blob *blob,
 	}
 
 	ctx->blob = blob;
-	ctx->pages = spdk_dma_realloc(ctx->pages, SPDK_BS_PAGE_SIZE,
-				      SPDK_BS_PAGE_SIZE, NULL);
+	ctx->pages = spdk_realloc(ctx->pages, SPDK_BS_PAGE_SIZE, SPDK_BS_PAGE_SIZE);
 	if (!ctx->pages) {
 		free(ctx);
 		cb_fn(seq, cb_arg, -ENOMEM);
@@ -1056,12 +1099,22 @@ struct spdk_blob_persist_ctx {
 
 	struct spdk_blob_md_page	*pages;
 
-	uint64_t			idx;
-
 	spdk_bs_sequence_t		*seq;
 	spdk_bs_sequence_cpl		cb_fn;
 	void				*cb_arg;
 };
+
+static void
+spdk_bs_batch_clear_dev(struct spdk_blob_persist_ctx *ctx, spdk_bs_batch_t *batch, uint64_t lba,
+			uint32_t lba_count)
+{
+	if (ctx->blob->clear_method == BLOB_CLEAR_WITH_DEFAULT ||
+	    ctx->blob->clear_method == BLOB_CLEAR_WITH_UNMAP) {
+		spdk_bs_batch_unmap_dev(batch, lba, lba_count);
+	} else if (ctx->blob->clear_method == BLOB_CLEAR_WITH_WRITE_ZEROES) {
+		spdk_bs_batch_write_zeroes_dev(batch, lba, lba_count);
+	}
+}
 
 static void
 _spdk_blob_persist_complete(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
@@ -1077,17 +1130,16 @@ _spdk_blob_persist_complete(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	ctx->cb_fn(seq, ctx->cb_arg, bserrno);
 
 	/* Free the memory */
-	spdk_dma_free(ctx->pages);
+	spdk_free(ctx->pages);
 	free(ctx);
 }
 
 static void
-_spdk_blob_persist_unmap_clusters_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+_spdk_blob_persist_clear_clusters_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_blob_persist_ctx	*ctx = cb_arg;
 	struct spdk_blob		*blob = ctx->blob;
 	struct spdk_blob_store		*bs = blob->bs;
-	void				*tmp;
 	size_t				i;
 
 	/* Release all clusters that were truncated */
@@ -1104,10 +1156,15 @@ _spdk_blob_persist_unmap_clusters_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int
 		free(blob->active.clusters);
 		blob->active.clusters = NULL;
 		blob->active.cluster_array_size = 0;
-	} else {
+	} else if (blob->active.num_clusters != blob->active.cluster_array_size) {
+#ifndef __clang_analyzer__
+		void *tmp;
+
+		/* scan-build really can't figure reallocs, workaround it */
 		tmp = realloc(blob->active.clusters, sizeof(uint64_t) * blob->active.num_clusters);
 		assert(tmp != NULL);
 		blob->active.clusters = tmp;
+#endif
 		blob->active.cluster_array_size = blob->active.num_clusters;
 	}
 
@@ -1115,7 +1172,7 @@ _spdk_blob_persist_unmap_clusters_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int
 }
 
 static void
-_spdk_blob_persist_unmap_clusters(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+_spdk_blob_persist_clear_clusters(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_blob_persist_ctx	*ctx = cb_arg;
 	struct spdk_blob		*blob = ctx->blob;
@@ -1129,9 +1186,9 @@ _spdk_blob_persist_unmap_clusters(spdk_bs_sequence_t *seq, void *cb_arg, int bse
 	 * at the end, but no changes ever occur in the middle of the list.
 	 */
 
-	batch = spdk_bs_sequence_to_batch(seq, _spdk_blob_persist_unmap_clusters_cpl, ctx);
+	batch = spdk_bs_sequence_to_batch(seq, _spdk_blob_persist_clear_clusters_cpl, ctx);
 
-	/* Unmap all clusters that were truncated */
+	/* Clear all clusters that were truncated */
 	lba = 0;
 	lba_count = 0;
 	for (i = blob->active.num_clusters; i < blob->active.cluster_array_size; i++) {
@@ -1146,11 +1203,9 @@ _spdk_blob_persist_unmap_clusters(spdk_bs_sequence_t *seq, void *cb_arg, int bse
 
 		/* This cluster is not contiguous with the previous one. */
 
-		/* If a run of LBAs previously existing, send them
-		 * as an unmap.
-		 */
+		/* If a run of LBAs previously existing, clear them now */
 		if (lba_count > 0) {
-			spdk_bs_batch_unmap_dev(batch, lba, lba_count);
+			spdk_bs_batch_clear_dev(ctx, batch, lba, lba_count);
 		}
 
 		/* Start building the next batch */
@@ -1162,9 +1217,9 @@ _spdk_blob_persist_unmap_clusters(spdk_bs_sequence_t *seq, void *cb_arg, int bse
 		}
 	}
 
-	/* If we ended with a contiguous set of LBAs, send the unmap now */
+	/* If we ended with a contiguous set of LBAs, clear them now */
 	if (lba_count > 0) {
-		spdk_bs_batch_unmap_dev(batch, lba, lba_count);
+		spdk_bs_batch_clear_dev(ctx, batch, lba, lba_count);
 	}
 
 	spdk_bs_batch_close(batch);
@@ -1193,8 +1248,8 @@ _spdk_blob_persist_zero_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bse
 		spdk_bit_array_clear(bs->used_md_pages, page_num);
 	}
 
-	/* Move on to unmapping clusters */
-	_spdk_blob_persist_unmap_clusters(seq, ctx, 0);
+	/* Move on to clearing clusters */
+	_spdk_blob_persist_clear_clusters(seq, ctx, 0);
 }
 
 static void
@@ -1333,7 +1388,7 @@ _spdk_blob_resize(struct spdk_blob *blob, uint64_t sz)
 		lfc = 0;
 		for (i = num_clusters; i < sz; i++) {
 			lfc = spdk_bit_array_find_first_clear(bs->used_clusters, lfc);
-			if (lfc >= bs->total_clusters) {
+			if (lfc == UINT32_MAX) {
 				/* No more free clusters. Cannot satisfy the request */
 				return -ENOSPC;
 			}
@@ -1385,7 +1440,6 @@ _spdk_blob_persist_start(struct spdk_blob_persist_ctx *ctx)
 		/* This is the signal that the blob should be deleted.
 		 * Immediately jump to the clean up routine. */
 		assert(blob->clean.num_pages > 0);
-		ctx->idx = blob->clean.num_pages - 1;
 		blob->state = SPDK_BLOB_STATE_CLEAN;
 		_spdk_blob_persist_zero_pages(seq, ctx, 0);
 		return;
@@ -1416,7 +1470,7 @@ _spdk_blob_persist_start(struct spdk_blob_persist_ctx *ctx)
 	/* Note that this loop starts at one. The first page location is fixed by the blobid. */
 	for (i = 1; i < blob->active.num_pages; i++) {
 		page_num = spdk_bit_array_find_first_clear(bs->used_md_pages, page_num);
-		if (page_num >= spdk_bit_array_capacity(bs->used_md_pages)) {
+		if (page_num == UINT32_MAX) {
 			_spdk_blob_persist_complete(seq, ctx, -ENOMEM);
 			return;
 		}
@@ -1437,7 +1491,6 @@ _spdk_blob_persist_start(struct spdk_blob_persist_ctx *ctx)
 	}
 	ctx->pages[i - 1].crc = _spdk_blob_md_page_calc_crc(&ctx->pages[i - 1]);
 	/* Start writing the metadata from last page to first */
-	ctx->idx = blob->active.num_pages - 1;
 	blob->state = SPDK_BLOB_STATE_CLEAN;
 	_spdk_blob_persist_write_page_chain(seq, ctx, 0);
 }
@@ -1449,7 +1502,7 @@ _spdk_blob_persist_dirty_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 
 	ctx->blob->bs->clean = 0;
 
-	spdk_dma_free(ctx->super);
+	spdk_free(ctx->super);
 
 	_spdk_blob_persist_start(ctx);
 }
@@ -1498,7 +1551,8 @@ _spdk_blob_persist(spdk_bs_sequence_t *seq, struct spdk_blob *blob,
 	ctx->cb_arg = cb_arg;
 
 	if (blob->bs->clean) {
-		ctx->super = spdk_dma_zmalloc(sizeof(*ctx->super), 0x1000, NULL);
+		ctx->super = spdk_zmalloc(sizeof(*ctx->super), 0x1000, NULL,
+					  SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 		if (!ctx->super) {
 			cb_fn(seq, cb_arg, -ENOMEM);
 			free(ctx);
@@ -1542,7 +1596,7 @@ _spdk_blob_allocate_and_copy_cluster_cpl(void *cb_arg, int bserrno)
 		}
 	}
 
-	spdk_dma_free(ctx->buf);
+	spdk_free(ctx->buf);
 	free(ctx);
 }
 
@@ -1552,17 +1606,13 @@ _spdk_blob_insert_cluster_cpl(void *cb_arg, int bserrno)
 	struct spdk_blob_copy_cluster_ctx *ctx = cb_arg;
 
 	if (bserrno) {
-		uint32_t cluster_number;
-
 		if (bserrno == -EEXIST) {
 			/* The metadata insert failed because another thread
 			 * allocated the cluster first. Free our cluster
 			 * but continue without error. */
 			bserrno = 0;
 		}
-
-		cluster_number = _spdk_bs_page_to_cluster(ctx->blob->bs, ctx->page);
-		_spdk_bs_release_cluster(ctx->blob->bs, cluster_number);
+		_spdk_bs_release_cluster(ctx->blob->bs, ctx->new_cluster);
 	}
 
 	spdk_bs_sequence_finish(ctx->seq, bserrno);
@@ -1607,7 +1657,7 @@ _spdk_blob_write_copy(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 static void
 _spdk_bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 				   struct spdk_io_channel *_ch,
-				   uint64_t offset, spdk_bs_user_op_t *op)
+				   uint64_t io_unit, spdk_bs_user_op_t *op)
 {
 	struct spdk_bs_cpl cpl;
 	struct spdk_bs_channel *ch;
@@ -1626,12 +1676,12 @@ _spdk_bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 		return;
 	}
 
-	/* Round the page offset down to the first page in the cluster */
-	cluster_start_page = _spdk_bs_page_to_cluster_start(blob, offset);
+	/* Round the io_unit offset down to the first page in the cluster */
+	cluster_start_page = _spdk_bs_io_unit_to_cluster_start(blob, io_unit);
 
 	/* Calculate which index in the metadata cluster array the corresponding
 	 * cluster is supposed to be at. */
-	cluster_number = _spdk_bs_page_to_cluster(blob->bs, cluster_start_page);
+	cluster_number = _spdk_bs_io_unit_to_cluster_number(blob, io_unit);
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
@@ -1644,18 +1694,21 @@ _spdk_bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 	ctx->blob = blob;
 	ctx->page = cluster_start_page;
 
-	ctx->buf = spdk_dma_malloc(blob->bs->cluster_sz, blob->back_bs_dev->blocklen, NULL);
-	if (!ctx->buf) {
-		SPDK_ERRLOG("DMA allocation for cluster of size = %" PRIu32 " failed.\n",
-			    blob->bs->cluster_sz);
-		free(ctx);
-		spdk_bs_user_op_abort(op);
-		return;
+	if (blob->parent_id != SPDK_BLOBID_INVALID) {
+		ctx->buf = spdk_malloc(blob->bs->cluster_sz, blob->back_bs_dev->blocklen,
+				       NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+		if (!ctx->buf) {
+			SPDK_ERRLOG("DMA allocation for cluster of size = %" PRIu32 " failed.\n",
+				    blob->bs->cluster_sz);
+			free(ctx);
+			spdk_bs_user_op_abort(op);
+			return;
+		}
 	}
 
 	rc = _spdk_bs_allocate_cluster(blob, cluster_number, &ctx->new_cluster, false);
 	if (rc != 0) {
-		spdk_dma_free(ctx->buf);
+		spdk_free(ctx->buf);
 		free(ctx);
 		spdk_bs_user_op_abort(op);
 		return;
@@ -1668,7 +1721,7 @@ _spdk_bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 	ctx->seq = spdk_bs_sequence_start(_ch, &cpl);
 	if (!ctx->seq) {
 		_spdk_bs_release_cluster(blob->bs, ctx->new_cluster);
-		spdk_dma_free(ctx->buf);
+		spdk_free(ctx->buf);
 		free(ctx);
 		spdk_bs_user_op_abort(op);
 		return;
@@ -1677,33 +1730,38 @@ _spdk_bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 	/* Queue the user op to block other incoming operations */
 	TAILQ_INSERT_TAIL(&ch->need_cluster_alloc, op, link);
 
-	/* Read cluster from backing device */
-	spdk_bs_sequence_read_bs_dev(ctx->seq, blob->back_bs_dev, ctx->buf,
-				     _spdk_bs_dev_page_to_lba(blob->back_bs_dev, cluster_start_page),
-				     _spdk_bs_dev_byte_to_lba(blob->back_bs_dev, blob->bs->cluster_sz),
-				     _spdk_blob_write_copy, ctx);
+	if (blob->parent_id != SPDK_BLOBID_INVALID) {
+		/* Read cluster from backing device */
+		spdk_bs_sequence_read_bs_dev(ctx->seq, blob->back_bs_dev, ctx->buf,
+					     _spdk_bs_dev_page_to_lba(blob->back_bs_dev, cluster_start_page),
+					     _spdk_bs_dev_byte_to_lba(blob->back_bs_dev, blob->bs->cluster_sz),
+					     _spdk_blob_write_copy, ctx);
+	} else {
+		_spdk_blob_insert_cluster_on_md_thread(ctx->blob, cluster_number, ctx->new_cluster,
+						       _spdk_blob_insert_cluster_cpl, ctx);
+	}
 }
 
 static void
-_spdk_blob_calculate_lba_and_lba_count(struct spdk_blob *blob, uint64_t page, uint64_t length,
+_spdk_blob_calculate_lba_and_lba_count(struct spdk_blob *blob, uint64_t io_unit, uint64_t length,
 				       uint64_t *lba,	uint32_t *lba_count)
 {
-	*lba_count = _spdk_bs_page_to_lba(blob->bs, length);
+	*lba_count = length;
 
-	if (!_spdk_bs_page_is_allocated(blob, page)) {
+	if (!_spdk_bs_io_unit_is_allocated(blob, io_unit)) {
 		assert(blob->back_bs_dev != NULL);
-		*lba = _spdk_bs_dev_page_to_lba(blob->back_bs_dev, page);
-		*lba_count = _spdk_bs_blob_lba_to_back_dev_lba(blob, *lba_count);
+		*lba = _spdk_bs_io_unit_to_back_dev_lba(blob, io_unit);
+		*lba_count = _spdk_bs_io_unit_to_back_dev_lba(blob, *lba_count);
 	} else {
-		*lba = _spdk_bs_blob_page_to_lba(blob, page);
+		*lba = _spdk_bs_blob_io_unit_to_lba(blob, io_unit);
 	}
 }
 
 struct op_split_ctx {
 	struct spdk_blob *blob;
 	struct spdk_io_channel *channel;
-	uint64_t page_offset;
-	uint64_t pages_remaining;
+	uint64_t io_unit_offset;
+	uint64_t io_units_remaining;
 	void *curr_payload;
 	enum spdk_blob_op_type op_type;
 	spdk_bs_sequence_t *seq;
@@ -1717,23 +1775,24 @@ _spdk_blob_request_submit_op_split_next(void *cb_arg, int bserrno)
 	struct spdk_io_channel	*ch = ctx->channel;
 	enum spdk_blob_op_type	op_type = ctx->op_type;
 	uint8_t			*buf = ctx->curr_payload;
-	uint64_t		offset = ctx->page_offset;
-	uint64_t		length = ctx->pages_remaining;
+	uint64_t		offset = ctx->io_unit_offset;
+	uint64_t		length = ctx->io_units_remaining;
 	uint64_t		op_length;
 
-	if (bserrno != 0 || ctx->pages_remaining == 0) {
+	if (bserrno != 0 || ctx->io_units_remaining == 0) {
 		spdk_bs_sequence_finish(ctx->seq, bserrno);
 		free(ctx);
 		return;
 	}
 
-	op_length = spdk_min(length, _spdk_bs_num_pages_to_cluster_boundary(blob, offset));
+	op_length = spdk_min(length, _spdk_bs_num_io_units_to_cluster_boundary(blob,
+			     offset));
 
 	/* Update length and payload for next operation */
-	ctx->pages_remaining -= op_length;
-	ctx->page_offset += op_length;
+	ctx->io_units_remaining -= op_length;
+	ctx->io_unit_offset += op_length;
 	if (op_type == SPDK_BLOB_WRITE || op_type == SPDK_BLOB_READ) {
-		ctx->curr_payload += (op_length * SPDK_BS_PAGE_SIZE);
+		ctx->curr_payload += op_length * blob->bs->io_unit_size;
 	}
 
 	switch (op_type) {
@@ -1755,7 +1814,7 @@ _spdk_blob_request_submit_op_split_next(void *cb_arg, int bserrno)
 		break;
 	case SPDK_BLOB_READV:
 	case SPDK_BLOB_WRITEV:
-		SPDK_ERRLOG("readv/write not valid for %s\n", __func__);
+		SPDK_ERRLOG("readv/write not valid\n");
 		spdk_bs_sequence_finish(ctx->seq, -EINVAL);
 		free(ctx);
 		break;
@@ -1793,8 +1852,8 @@ _spdk_blob_request_submit_op_split(struct spdk_io_channel *ch, struct spdk_blob 
 	ctx->blob = blob;
 	ctx->channel = ch;
 	ctx->curr_payload = payload;
-	ctx->page_offset = offset;
-	ctx->pages_remaining = length;
+	ctx->io_unit_offset = offset;
+	ctx->io_units_remaining = length;
 	ctx->op_type = op_type;
 	ctx->seq = seq;
 
@@ -1844,7 +1903,7 @@ _spdk_blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blo
 			return;
 		}
 
-		if (_spdk_bs_page_is_allocated(blob, offset)) {
+		if (_spdk_bs_io_unit_is_allocated(blob, offset)) {
 			/* Read from the blob */
 			spdk_bs_batch_read_dev(batch, payload, lba, lba_count);
 		} else {
@@ -1857,7 +1916,7 @@ _spdk_blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blo
 	}
 	case SPDK_BLOB_WRITE:
 	case SPDK_BLOB_WRITE_ZEROES: {
-		if (_spdk_bs_page_is_allocated(blob, offset)) {
+		if (_spdk_bs_io_unit_is_allocated(blob, offset)) {
 			/* Write to the blob */
 			spdk_bs_batch_t *batch;
 
@@ -1902,7 +1961,7 @@ _spdk_blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blo
 			return;
 		}
 
-		if (_spdk_bs_page_is_allocated(blob, offset)) {
+		if (_spdk_bs_io_unit_is_allocated(blob, offset)) {
 			spdk_bs_batch_unmap_dev(batch, lba, lba_count);
 		}
 
@@ -1929,12 +1988,11 @@ _spdk_blob_request_submit_op(struct spdk_blob *blob, struct spdk_io_channel *_ch
 		return;
 	}
 
-	if (offset + length > blob->active.num_clusters * blob->bs->pages_per_cluster) {
+	if (offset + length > _spdk_bs_cluster_to_lba(blob->bs, blob->active.num_clusters)) {
 		cb_fn(cb_arg, -EINVAL);
 		return;
 	}
-
-	if (length <= _spdk_bs_num_pages_to_cluster_boundary(blob, offset)) {
+	if (length <= _spdk_bs_num_io_units_to_cluster_boundary(blob, offset)) {
 		_spdk_blob_request_submit_op_single(_channel, blob, payload, offset, length,
 						    cb_fn, cb_arg, op_type);
 	} else {
@@ -1951,9 +2009,9 @@ struct rw_iov_ctx {
 	bool read;
 	int iovcnt;
 	struct iovec *orig_iov;
-	uint64_t page_offset;
-	uint64_t pages_remaining;
-	uint64_t pages_done;
+	uint64_t io_unit_offset;
+	uint64_t io_units_remaining;
+	uint64_t io_units_done;
 	struct iovec iov[0];
 };
 
@@ -1972,25 +2030,24 @@ _spdk_rw_iov_split_next(void *cb_arg, int bserrno)
 	struct iovec *iov, *orig_iov;
 	int iovcnt;
 	size_t orig_iovoff;
-	uint64_t page_count, pages_to_boundary, page_offset;
+	uint64_t io_units_count, io_units_to_boundary, io_unit_offset;
 	uint64_t byte_count;
 
-	if (bserrno != 0 || ctx->pages_remaining == 0) {
+	if (bserrno != 0 || ctx->io_units_remaining == 0) {
 		ctx->cb_fn(ctx->cb_arg, bserrno);
 		free(ctx);
 		return;
 	}
 
-	page_offset = ctx->page_offset;
-	pages_to_boundary = _spdk_bs_num_pages_to_cluster_boundary(blob, page_offset);
-	page_count = spdk_min(ctx->pages_remaining, pages_to_boundary);
-
+	io_unit_offset = ctx->io_unit_offset;
+	io_units_to_boundary = _spdk_bs_num_io_units_to_cluster_boundary(blob, io_unit_offset);
+	io_units_count = spdk_min(ctx->io_units_remaining, io_units_to_boundary);
 	/*
 	 * Get index and offset into the original iov array for our current position in the I/O sequence.
 	 *  byte_count will keep track of how many bytes remaining until orig_iov and orig_iovoff will
 	 *  point to the current position in the I/O sequence.
 	 */
-	byte_count = ctx->pages_done * sizeof(struct spdk_blob_md_page);
+	byte_count = ctx->io_units_done * blob->bs->io_unit_size;
 	orig_iov = &ctx->orig_iov[0];
 	orig_iovoff = 0;
 	while (byte_count > 0) {
@@ -2007,10 +2064,11 @@ _spdk_rw_iov_split_next(void *cb_arg, int bserrno)
 	 * Build an iov array for the next I/O in the sequence.  byte_count will keep track of how many
 	 *  bytes of this next I/O remain to be accounted for in the new iov array.
 	 */
-	byte_count = page_count * sizeof(struct spdk_blob_md_page);
+	byte_count = io_units_count * blob->bs->io_unit_size;
 	iov = &ctx->iov[0];
 	iovcnt = 0;
 	while (byte_count > 0) {
+		assert(iovcnt < ctx->iovcnt);
 		iov->iov_len = spdk_min(byte_count, orig_iov->iov_len - orig_iovoff);
 		iov->iov_base = orig_iov->iov_base + orig_iovoff;
 		byte_count -= iov->iov_len;
@@ -2020,17 +2078,17 @@ _spdk_rw_iov_split_next(void *cb_arg, int bserrno)
 		iovcnt++;
 	}
 
-	ctx->page_offset += page_count;
-	ctx->pages_done += page_count;
-	ctx->pages_remaining -= page_count;
+	ctx->io_unit_offset += io_units_count;
+	ctx->io_units_remaining -= io_units_count;
+	ctx->io_units_done += io_units_count;
 	iov = &ctx->iov[0];
 
 	if (ctx->read) {
-		spdk_blob_io_readv(ctx->blob, ctx->channel, iov, iovcnt, page_offset,
-				   page_count, _spdk_rw_iov_split_next, ctx);
+		spdk_blob_io_readv(ctx->blob, ctx->channel, iov, iovcnt, io_unit_offset,
+				   io_units_count, _spdk_rw_iov_split_next, ctx);
 	} else {
-		spdk_blob_io_writev(ctx->blob, ctx->channel, iov, iovcnt, page_offset,
-				    page_count, _spdk_rw_iov_split_next, ctx);
+		spdk_blob_io_writev(ctx->blob, ctx->channel, iov, iovcnt, io_unit_offset,
+				    io_units_count, _spdk_rw_iov_split_next, ctx);
 	}
 }
 
@@ -2053,7 +2111,7 @@ _spdk_blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel 
 		return;
 	}
 
-	if (offset + length > blob->active.num_clusters * blob->bs->pages_per_cluster) {
+	if (offset + length > _spdk_bs_cluster_to_lba(blob->bs, blob->active.num_clusters)) {
 		cb_fn(cb_arg, -EINVAL);
 		return;
 	}
@@ -2072,21 +2130,22 @@ _spdk_blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel 
 	 *  in a batch.  That would also require creating an intermediate spdk_bs_cpl that would get called
 	 *  when the batch was completed, to allow for freeing the memory for the iov arrays.
 	 */
-	if (spdk_likely(length <= _spdk_bs_num_pages_to_cluster_boundary(blob, offset))) {
+	if (spdk_likely(length <= _spdk_bs_num_io_units_to_cluster_boundary(blob, offset))) {
 		uint32_t lba_count;
 		uint64_t lba;
-
-		_spdk_blob_calculate_lba_and_lba_count(blob, offset, length, &lba, &lba_count);
 
 		cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
 		cpl.u.blob_basic.cb_fn = cb_fn;
 		cpl.u.blob_basic.cb_arg = cb_arg;
+
 		if (blob->frozen_refcnt) {
 			/* This blob I/O is frozen */
+			enum spdk_blob_op_type op_type;
 			spdk_bs_user_op_t *op;
 			struct spdk_bs_channel *bs_channel = spdk_io_channel_get_ctx(_channel);
 
-			op = spdk_bs_user_op_alloc(_channel, &cpl, read, blob, iov, iovcnt, offset, length);
+			op_type = read ? SPDK_BLOB_READV : SPDK_BLOB_WRITEV;
+			op = spdk_bs_user_op_alloc(_channel, &cpl, op_type, blob, iov, iovcnt, offset, length);
 			if (!op) {
 				cb_fn(cb_arg, -ENOMEM);
 				return;
@@ -2097,6 +2156,8 @@ _spdk_blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel 
 			return;
 		}
 
+		_spdk_blob_calculate_lba_and_lba_count(blob, offset, length, &lba, &lba_count);
+
 		if (read) {
 			spdk_bs_sequence_t *seq;
 
@@ -2106,14 +2167,14 @@ _spdk_blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel 
 				return;
 			}
 
-			if (_spdk_bs_page_is_allocated(blob, offset)) {
+			if (_spdk_bs_io_unit_is_allocated(blob, offset)) {
 				spdk_bs_sequence_readv_dev(seq, iov, iovcnt, lba, lba_count, _spdk_rw_iov_done, NULL);
 			} else {
 				spdk_bs_sequence_readv_bs_dev(seq, blob->back_bs_dev, iov, iovcnt, lba, lba_count,
 							      _spdk_rw_iov_done, NULL);
 			}
 		} else {
-			if (_spdk_bs_page_is_allocated(blob, offset)) {
+			if (_spdk_bs_io_unit_is_allocated(blob, offset)) {
 				spdk_bs_sequence_t *seq;
 
 				seq = spdk_bs_sequence_start(_channel, &cpl);
@@ -2127,7 +2188,8 @@ _spdk_blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel 
 				/* Queue this operation and allocate the cluster */
 				spdk_bs_user_op_t *op;
 
-				op = spdk_bs_user_op_alloc(_channel, &cpl, SPDK_BLOB_WRITEV, blob, iov, iovcnt, offset, length);
+				op = spdk_bs_user_op_alloc(_channel, &cpl, SPDK_BLOB_WRITEV, blob, iov, iovcnt, offset,
+							   length);
 				if (!op) {
 					cb_fn(cb_arg, -ENOMEM);
 					return;
@@ -2152,9 +2214,9 @@ _spdk_blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel 
 		ctx->read = read;
 		ctx->orig_iov = iov;
 		ctx->iovcnt = iovcnt;
-		ctx->page_offset = offset;
-		ctx->pages_remaining = length;
-		ctx->pages_done = 0;
+		ctx->io_unit_offset = offset;
+		ctx->io_units_remaining = length;
+		ctx->io_units_done = 0;
 
 		_spdk_rw_iov_split_next(ctx, 0);
 	}
@@ -2172,6 +2234,35 @@ _spdk_blob_lookup(struct spdk_blob_store *bs, spdk_blob_id blobid)
 	}
 
 	return NULL;
+}
+
+static void
+_spdk_blob_get_snapshot_and_clone_entries(struct spdk_blob *blob,
+		struct spdk_blob_list **snapshot_entry, struct spdk_blob_list **clone_entry)
+{
+	assert(blob != NULL);
+	*snapshot_entry = NULL;
+	*clone_entry = NULL;
+
+	if (blob->parent_id == SPDK_BLOBID_INVALID) {
+		return;
+	}
+
+	TAILQ_FOREACH(*snapshot_entry, &blob->bs->snapshots, link) {
+		if ((*snapshot_entry)->id == blob->parent_id) {
+			break;
+		}
+	}
+
+	if (*snapshot_entry != NULL) {
+		TAILQ_FOREACH(*clone_entry, &(*snapshot_entry)->clones, link) {
+			if ((*clone_entry)->id == blob->id) {
+				break;
+			}
+		}
+
+		assert(clone_entry != NULL);
+	}
 }
 
 static int
@@ -2275,12 +2366,7 @@ _spdk_bs_blob_list_add(struct spdk_blob *blob)
 		return 0;
 	}
 
-	TAILQ_FOREACH(snapshot_entry, &blob->bs->snapshots, link) {
-		if (snapshot_entry->id == snapshot_id) {
-			break;
-		}
-	}
-
+	snapshot_entry = _spdk_bs_get_snapshot_entry(blob->bs, snapshot_id);
 	if (snapshot_entry == NULL) {
 		/* Snapshot not found */
 		snapshot_entry = calloc(1, sizeof(struct spdk_blob_list));
@@ -2313,48 +2399,23 @@ _spdk_bs_blob_list_add(struct spdk_blob *blob)
 	return 0;
 }
 
-static int
+static void
 _spdk_bs_blob_list_remove(struct spdk_blob *blob)
 {
 	struct spdk_blob_list *snapshot_entry = NULL;
 	struct spdk_blob_list *clone_entry = NULL;
-	spdk_blob_id snapshot_id;
 
-	assert(blob != NULL);
+	_spdk_blob_get_snapshot_and_clone_entries(blob, &snapshot_entry, &clone_entry);
 
-	snapshot_id = blob->parent_id;
-	if (snapshot_id == SPDK_BLOBID_INVALID) {
-		return 0;
+	if (snapshot_entry == NULL) {
+		return;
 	}
-
-	TAILQ_FOREACH(snapshot_entry, &blob->bs->snapshots, link) {
-		if (snapshot_entry->id == snapshot_id) {
-			break;
-		}
-	}
-
-	assert(snapshot_entry != NULL);
-
-	TAILQ_FOREACH(clone_entry, &snapshot_entry->clones, link) {
-		if (clone_entry->id == blob->id) {
-			break;
-		}
-	}
-
-	assert(clone_entry != NULL);
 
 	blob->parent_id = SPDK_BLOBID_INVALID;
 	TAILQ_REMOVE(&snapshot_entry->clones, clone_entry, link);
 	free(clone_entry);
 
 	snapshot_entry->clone_count--;
-	if (snapshot_entry->clone_count == 0) {
-		/* Snapshot have no more clones */
-		TAILQ_REMOVE(&blob->bs->snapshots, snapshot_entry, link);
-		free(snapshot_entry);
-	}
-
-	return 0;
 }
 
 static int
@@ -2393,6 +2454,7 @@ spdk_bs_opts_init(struct spdk_bs_opts *opts)
 	opts->num_md_pages = SPDK_BLOB_OPTS_NUM_MD_PAGES;
 	opts->max_md_ops = SPDK_BLOB_OPTS_MAX_MD_OPS;
 	opts->max_channel_ops = SPDK_BLOB_OPTS_DEFAULT_CHANNEL_OPS;
+	opts->clear_method = BS_CLEAR_WITH_UNMAP;
 	memset(&opts->bstype, 0, sizeof(opts->bstype));
 	opts->iter_cb_fn = NULL;
 	opts->iter_cb_arg = NULL;
@@ -2410,8 +2472,8 @@ _spdk_bs_opts_verify(struct spdk_bs_opts *opts)
 	return 0;
 }
 
-static struct spdk_blob_store *
-_spdk_bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts)
+static int
+_spdk_bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob_store **_bs)
 {
 	struct spdk_blob_store	*bs;
 	uint64_t dev_size;
@@ -2420,19 +2482,19 @@ _spdk_bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts)
 	dev_size = dev->blocklen * dev->blockcnt;
 	if (dev_size < opts->cluster_sz) {
 		/* Device size cannot be smaller than cluster size of blobstore */
-		SPDK_ERRLOG("Device size %" PRIu64 " is smaller than cluster size %" PRIu32 "\n",
-			    dev_size, opts->cluster_sz);
-		return NULL;
+		SPDK_INFOLOG(SPDK_LOG_BLOB, "Device size %" PRIu64 " is smaller than cluster size %" PRIu32 "\n",
+			     dev_size, opts->cluster_sz);
+		return -ENOSPC;
 	}
 	if (opts->cluster_sz < SPDK_BS_PAGE_SIZE) {
 		/* Cluster size cannot be smaller than page size */
 		SPDK_ERRLOG("Cluster size %" PRIu32 " is smaller than page size %d\n",
 			    opts->cluster_sz, SPDK_BS_PAGE_SIZE);
-		return NULL;
+		return -EINVAL;
 	}
 	bs = calloc(1, sizeof(struct spdk_blob_store));
 	if (!bs) {
-		return NULL;
+		return -ENOMEM;
 	}
 
 	TAILQ_INIT(&bs->blobs);
@@ -2450,9 +2512,10 @@ _spdk_bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts)
 	bs->pages_per_cluster = bs->cluster_sz / SPDK_BS_PAGE_SIZE;
 	bs->num_free_clusters = bs->total_clusters;
 	bs->used_clusters = spdk_bit_array_create(bs->total_clusters);
+	bs->io_unit_size = dev->blocklen;
 	if (bs->used_clusters == NULL) {
 		free(bs);
-		return NULL;
+		return -ENOMEM;
 	}
 
 	bs->max_channel_ops = opts->max_channel_ops;
@@ -2466,7 +2529,7 @@ _spdk_bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts)
 	pthread_mutex_init(&bs->used_clusters_mutex, NULL);
 
 	spdk_io_device_register(bs, _spdk_bs_channel_create, _spdk_bs_channel_destroy,
-				sizeof(struct spdk_bs_channel));
+				sizeof(struct spdk_bs_channel), "blobstore");
 	rc = spdk_bs_register_md_thread(bs);
 	if (rc == -1) {
 		spdk_io_device_unregister(bs, NULL);
@@ -2475,10 +2538,12 @@ _spdk_bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts)
 		spdk_bit_array_free(&bs->used_md_pages);
 		spdk_bit_array_free(&bs->used_clusters);
 		free(bs);
-		return NULL;
+		/* FIXME: this is a lie but don't know how to get a proper error code here */
+		return -ENOMEM;
 	}
 
-	return bs;
+	*_bs = bs;
+	return 0;
 }
 
 /* START spdk_bs_load, spdk_bs_load_ctx will used for both load and unload. */
@@ -2492,11 +2557,12 @@ struct spdk_bs_load_ctx {
 	uint32_t			page_index;
 	uint32_t			cur_page;
 	struct spdk_blob_md_page	*page;
-	bool				is_load;
 
 	spdk_bs_sequence_t			*seq;
 	spdk_blob_op_with_handle_complete	iter_cb_fn;
 	void					*iter_cb_arg;
+	struct spdk_blob			*blob;
+	spdk_blob_id				blobid;
 };
 
 static void
@@ -2504,15 +2570,9 @@ _spdk_bs_load_ctx_fail(spdk_bs_sequence_t *seq, struct spdk_bs_load_ctx *ctx, in
 {
 	assert(bserrno != 0);
 
-	spdk_dma_free(ctx->super);
+	spdk_free(ctx->super);
 	spdk_bs_sequence_finish(seq, bserrno);
-	/*
-	 * Only free the blobstore when a load fails.  If an unload fails (for some reason)
-	 *  we want to keep the blobstore in case the caller wants to try again.
-	 */
-	if (ctx->is_load) {
-		_spdk_bs_free(ctx->bs);
-	}
+	_spdk_bs_free(ctx->bs);
 	free(ctx);
 }
 
@@ -2572,7 +2632,8 @@ _spdk_bs_write_used_clusters(spdk_bs_sequence_t *seq, void *arg, spdk_bs_sequenc
 
 	/* Write out the used clusters mask */
 	mask_size = ctx->super->used_cluster_mask_len * SPDK_BS_PAGE_SIZE;
-	ctx->mask = spdk_dma_zmalloc(mask_size, 0x1000, NULL);
+	ctx->mask = spdk_zmalloc(mask_size, 0x1000, NULL,
+				 SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 	if (!ctx->mask) {
 		_spdk_bs_load_ctx_fail(seq, ctx, -ENOMEM);
 		return;
@@ -2594,8 +2655,14 @@ _spdk_bs_write_used_md(spdk_bs_sequence_t *seq, void *arg, spdk_bs_sequence_cpl 
 	struct spdk_bs_load_ctx	*ctx = arg;
 	uint64_t	mask_size, lba, lba_count;
 
+	if (seq->bserrno) {
+		_spdk_bs_load_ctx_fail(seq, ctx, seq->bserrno);
+		return;
+	}
+
 	mask_size = ctx->super->used_page_mask_len * SPDK_BS_PAGE_SIZE;
-	ctx->mask = spdk_dma_zmalloc(mask_size, 0x1000, NULL);
+	ctx->mask = spdk_zmalloc(mask_size, 0x1000, NULL,
+				 SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 	if (!ctx->mask) {
 		_spdk_bs_load_ctx_fail(seq, ctx, -ENOMEM);
 		return;
@@ -2627,7 +2694,8 @@ _spdk_bs_write_used_blobids(spdk_bs_sequence_t *seq, void *arg, spdk_bs_sequence
 	}
 
 	mask_size = ctx->super->used_blobid_mask_len * SPDK_BS_PAGE_SIZE;
-	ctx->mask = spdk_dma_zmalloc(mask_size, 0x1000, NULL);
+	ctx->mask = spdk_zmalloc(mask_size, 0x1000, NULL, SPDK_ENV_SOCKET_ID_ANY,
+				 SPDK_MALLOC_DMA);
 	if (!ctx->mask) {
 		_spdk_bs_load_ctx_fail(seq, ctx, -ENOMEM);
 		return;
@@ -2644,35 +2712,176 @@ _spdk_bs_write_used_blobids(spdk_bs_sequence_t *seq, void *arg, spdk_bs_sequence
 }
 
 static void
-_spdk_bs_load_iter(void *arg, struct spdk_blob *blob, int bserrno)
+_spdk_blob_set_thin_provision(struct spdk_blob *blob)
 {
-	struct spdk_bs_load_ctx *ctx = arg;
+	_spdk_blob_verify_md_op(blob);
+	blob->invalid_flags |= SPDK_BLOB_THIN_PROV;
+	blob->state = SPDK_BLOB_STATE_DIRTY;
+}
 
-	if (bserrno == 0) {
-		if (ctx->iter_cb_fn) {
-			ctx->iter_cb_fn(ctx->iter_cb_arg, blob, 0);
-		}
-		_spdk_bs_blob_list_add(blob);
-		spdk_bs_iter_next(ctx->bs, blob, _spdk_bs_load_iter, ctx);
+static void _spdk_bs_load_iter(void *arg, struct spdk_blob *blob, int bserrno);
+
+static void
+_spdk_bs_delete_corrupted_blob_cpl(void *cb_arg, int bserrno)
+{
+	struct spdk_bs_load_ctx *ctx = cb_arg;
+	spdk_blob_id id;
+	int64_t page_num;
+
+	/* Iterate to next blob (we can't use spdk_bs_iter_next function as our
+	 * last blob has been removed */
+	page_num = _spdk_bs_blobid_to_page(ctx->blobid);
+	page_num++;
+	page_num = spdk_bit_array_find_first_set(ctx->bs->used_blobids, page_num);
+	if (page_num >= spdk_bit_array_capacity(ctx->bs->used_blobids)) {
+		_spdk_bs_load_iter(ctx, NULL, -ENOENT);
 		return;
 	}
 
-	if (bserrno == -ENOENT) {
+	id = _spdk_bs_page_to_blobid(page_num);
+
+	spdk_bs_open_blob(ctx->bs, id, _spdk_bs_load_iter, ctx);
+}
+
+static void
+_spdk_bs_delete_corrupted_close_cb(void *cb_arg, int bserrno)
+{
+	struct spdk_bs_load_ctx *ctx = cb_arg;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("Failed to close corrupted blob\n");
+		spdk_bs_iter_next(ctx->bs, ctx->blob, _spdk_bs_load_iter, ctx);
+		return;
+	}
+
+	spdk_bs_delete_blob(ctx->bs, ctx->blobid, _spdk_bs_delete_corrupted_blob_cpl, ctx);
+}
+
+static void
+_spdk_bs_delete_corrupted_blob(void *cb_arg, int bserrno)
+{
+	struct spdk_bs_load_ctx *ctx = cb_arg;
+	uint64_t i;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("Failed to close clone of a corrupted blob\n");
+		spdk_bs_iter_next(ctx->bs, ctx->blob, _spdk_bs_load_iter, ctx);
+		return;
+	}
+
+	/* Snapshot and clone have the same copy of cluster map at this point.
+	 * Let's clear cluster map for snpashot now so that it won't be cleared
+	 * for clone later when we remove snapshot. Also set thin provision to
+	 * pass data corruption check */
+	for (i = 0; i < ctx->blob->active.num_clusters; i++) {
+		ctx->blob->active.clusters[i] = 0;
+	}
+
+	ctx->blob->md_ro = false;
+
+	_spdk_blob_set_thin_provision(ctx->blob);
+
+	ctx->blobid = ctx->blob->id;
+
+	spdk_blob_close(ctx->blob, _spdk_bs_delete_corrupted_close_cb, ctx);
+}
+
+static void
+_spdk_bs_update_corrupted_blob(void *cb_arg, int bserrno)
+{
+	struct spdk_bs_load_ctx *ctx = cb_arg;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("Failed to close clone of a corrupted blob\n");
+		spdk_bs_iter_next(ctx->bs, ctx->blob, _spdk_bs_load_iter, ctx);
+		return;
+	}
+
+	ctx->blob->md_ro = false;
+	_spdk_blob_remove_xattr(ctx->blob, SNAPSHOT_PENDING_REMOVAL, true);
+	_spdk_blob_remove_xattr(ctx->blob, SNAPSHOT_IN_PROGRESS, true);
+	spdk_blob_set_read_only(ctx->blob);
+
+	if (ctx->iter_cb_fn) {
+		ctx->iter_cb_fn(ctx->iter_cb_arg, ctx->blob, 0);
+	}
+	_spdk_bs_blob_list_add(ctx->blob);
+
+	spdk_bs_iter_next(ctx->bs, ctx->blob, _spdk_bs_load_iter, ctx);
+}
+
+static void
+_spdk_bs_examine_clone(void *cb_arg, struct spdk_blob *blob, int bserrno)
+{
+	struct spdk_bs_load_ctx *ctx = cb_arg;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("Failed to open clone of a corrupted blob\n");
+		spdk_bs_iter_next(ctx->bs, ctx->blob, _spdk_bs_load_iter, ctx);
+		return;
+	}
+
+	if (blob->parent_id == ctx->blob->id) {
+		/* Power failure occured before updating clone (snapshot delete case)
+		 * or after updating clone (creating snapshot case) - keep snapshot */
+		spdk_blob_close(blob, _spdk_bs_update_corrupted_blob, ctx);
+	} else {
+		/* Power failure occured after updating clone (snapshot delete case)
+		 * or before updating clone (creating snapshot case) - remove snapshot */
+		spdk_blob_close(blob, _spdk_bs_delete_corrupted_blob, ctx);
+	}
+}
+
+static void
+_spdk_bs_load_iter(void *arg, struct spdk_blob *blob, int bserrno)
+{
+	struct spdk_bs_load_ctx *ctx = arg;
+	const void *value;
+	size_t len;
+	int rc = 0;
+
+	if (bserrno == 0) {
+		/* Examine blob if it is corrupted after power failure. Fix
+		 * the ones that can be fixed and remove any other corrupted
+		 * ones. If it is not corrupted just process it */
+		rc = _spdk_blob_get_xattr_value(blob, SNAPSHOT_PENDING_REMOVAL, &value, &len, true);
+		if (rc != 0) {
+			rc = _spdk_blob_get_xattr_value(blob, SNAPSHOT_IN_PROGRESS, &value, &len, true);
+			if (rc != 0) {
+				/* Not corrupted - process it and continue with iterating through blobs */
+				if (ctx->iter_cb_fn) {
+					ctx->iter_cb_fn(ctx->iter_cb_arg, blob, 0);
+				}
+				_spdk_bs_blob_list_add(blob);
+				spdk_bs_iter_next(ctx->bs, blob, _spdk_bs_load_iter, ctx);
+				return;
+			}
+
+		}
+
+		assert(len == sizeof(spdk_blob_id));
+
+		ctx->blob = blob;
+
+		/* Open clone to check if we are able to fix this blob or should we remove it */
+		spdk_bs_open_blob(ctx->bs, *(spdk_blob_id *)value, _spdk_bs_examine_clone, ctx);
+		return;
+	} else if (bserrno == -ENOENT) {
 		bserrno = 0;
 	} else {
 		/*
 		 * This case needs to be looked at further.  Same problem
 		 *  exists with applications that rely on explicit blob
 		 *  iteration.  We should just skip the blob that failed
-		 *  to load and coontinue on to the next one.
+		 *  to load and continue on to the next one.
 		 */
 		SPDK_ERRLOG("Error in iterating blobs\n");
 	}
 
 	ctx->iter_cb_fn = NULL;
 
-	spdk_dma_free(ctx->super);
-	spdk_dma_free(ctx->mask);
+	spdk_free(ctx->super);
+	spdk_free(ctx->mask);
 	spdk_bs_sequence_finish(ctx->seq, bserrno);
 	free(ctx);
 }
@@ -2703,7 +2912,7 @@ _spdk_bs_load_used_blobids_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrn
 
 	rc = _spdk_bs_load_mask(&ctx->bs->used_blobids, ctx->mask);
 	if (rc < 0) {
-		spdk_dma_free(ctx->mask);
+		spdk_free(ctx->mask);
 		_spdk_bs_load_ctx_fail(seq, ctx, rc);
 		return;
 	}
@@ -2728,7 +2937,7 @@ _spdk_bs_load_used_clusters_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserr
 
 	rc = _spdk_bs_load_mask(&ctx->bs->used_clusters, ctx->mask);
 	if (rc < 0) {
-		spdk_dma_free(ctx->mask);
+		spdk_free(ctx->mask);
 		_spdk_bs_load_ctx_fail(seq, ctx, rc);
 		return;
 	}
@@ -2736,11 +2945,12 @@ _spdk_bs_load_used_clusters_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserr
 	ctx->bs->num_free_clusters = spdk_bit_array_count_clear(ctx->bs->used_clusters);
 	assert(ctx->bs->num_free_clusters <= ctx->bs->total_clusters);
 
-	spdk_dma_free(ctx->mask);
+	spdk_free(ctx->mask);
 
 	/* Read the used blobids mask */
 	mask_size = ctx->super->used_blobid_mask_len * SPDK_BS_PAGE_SIZE;
-	ctx->mask = spdk_dma_zmalloc(mask_size, 0x1000, NULL);
+	ctx->mask = spdk_zmalloc(mask_size, 0x1000, NULL, SPDK_ENV_SOCKET_ID_ANY,
+				 SPDK_MALLOC_DMA);
 	if (!ctx->mask) {
 		_spdk_bs_load_ctx_fail(seq, ctx, -ENOMEM);
 		return;
@@ -2768,16 +2978,17 @@ _spdk_bs_load_used_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 
 	rc = _spdk_bs_load_mask(&ctx->bs->used_md_pages, ctx->mask);
 	if (rc < 0) {
-		spdk_dma_free(ctx->mask);
+		spdk_free(ctx->mask);
 		_spdk_bs_load_ctx_fail(seq, ctx, rc);
 		return;
 	}
 
-	spdk_dma_free(ctx->mask);
+	spdk_free(ctx->mask);
 
 	/* Read the used clusters mask */
 	mask_size = ctx->super->used_cluster_mask_len * SPDK_BS_PAGE_SIZE;
-	ctx->mask = spdk_dma_zmalloc(mask_size, 0x1000, NULL);
+	ctx->mask = spdk_zmalloc(mask_size, 0x1000, NULL, SPDK_ENV_SOCKET_ID_ANY,
+				 SPDK_MALLOC_DMA);
 	if (!ctx->mask) {
 		_spdk_bs_load_ctx_fail(seq, ctx, -ENOMEM);
 		return;
@@ -2796,7 +3007,8 @@ _spdk_bs_load_read_used_pages(spdk_bs_sequence_t *seq, void *cb_arg)
 
 	/* Read the used pages mask */
 	mask_size = ctx->super->used_page_mask_len * SPDK_BS_PAGE_SIZE;
-	ctx->mask = spdk_dma_zmalloc(mask_size, 0x1000, NULL);
+	ctx->mask = spdk_zmalloc(mask_size, 0x1000, NULL,
+				 SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 	if (!ctx->mask) {
 		_spdk_bs_load_ctx_fail(seq, ctx, -ENOMEM);
 		return;
@@ -2821,17 +3033,17 @@ _spdk_bs_load_replay_md_parse_page(const struct spdk_blob_md_page *page, struct 
 				/* If padding and length are 0, this terminates the page */
 				break;
 			}
-		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_EXTENT) {
-			struct spdk_blob_md_descriptor_extent	*desc_extent;
+		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_EXTENT_RLE) {
+			struct spdk_blob_md_descriptor_extent_rle	*desc_extent_rle;
 			unsigned int				i, j;
 			unsigned int				cluster_count = 0;
 			uint32_t				cluster_idx;
 
-			desc_extent = (struct spdk_blob_md_descriptor_extent *)desc;
+			desc_extent_rle = (struct spdk_blob_md_descriptor_extent_rle *)desc;
 
-			for (i = 0; i < desc_extent->length / sizeof(desc_extent->extents[0]); i++) {
-				for (j = 0; j < desc_extent->extents[i].length; j++) {
-					cluster_idx = desc_extent->extents[i].cluster_idx;
+			for (i = 0; i < desc_extent_rle->length / sizeof(desc_extent_rle->extents[0]); i++) {
+				for (j = 0; j < desc_extent_rle->extents[i].length; j++) {
+					cluster_idx = desc_extent_rle->extents[i].cluster_idx;
 					/*
 					 * cluster_idx = 0 means an unallocated cluster - don't mark that
 					 * in the used cluster map.
@@ -2878,7 +3090,8 @@ static bool _spdk_bs_load_cur_md_page_valid(struct spdk_bs_load_ctx *ctx)
 		return false;
 	}
 
-	if (_spdk_bs_page_to_blobid(ctx->cur_page) != ctx->page->id) {
+	if (ctx->page->sequence_num == 0 &&
+	    _spdk_bs_page_to_blobid(ctx->cur_page) != ctx->page->id) {
 		return false;
 	}
 	return true;
@@ -2900,7 +3113,7 @@ _spdk_bs_load_write_used_blobids_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int 
 {
 	struct spdk_bs_load_ctx	*ctx = cb_arg;
 
-	spdk_dma_free(ctx->mask);
+	spdk_free(ctx->mask);
 	ctx->mask = NULL;
 
 	_spdk_bs_write_used_clusters(seq, cb_arg, _spdk_bs_load_write_used_clusters_cpl);
@@ -2911,7 +3124,7 @@ _spdk_bs_load_write_used_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bs
 {
 	struct spdk_bs_load_ctx	*ctx = cb_arg;
 
-	spdk_dma_free(ctx->mask);
+	spdk_free(ctx->mask);
 	ctx->mask = NULL;
 
 	_spdk_bs_write_used_blobids(seq, cb_arg, _spdk_bs_load_write_used_blobids_cpl);
@@ -2967,11 +3180,11 @@ _spdk_bs_load_replay_md_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		_spdk_bs_load_replay_cur_md_page(seq, cb_arg);
 	} else {
 		/* Claim all of the clusters used by the metadata */
-		num_md_clusters = divide_round_up(ctx->super->md_len, ctx->bs->pages_per_cluster);
+		num_md_clusters = spdk_divide_round_up(ctx->super->md_len, ctx->bs->pages_per_cluster);
 		for (i = 0; i < num_md_clusters; i++) {
 			_spdk_bs_claim_cluster(ctx->bs, i);
 		}
-		spdk_dma_free(ctx->page);
+		spdk_free(ctx->page);
 		_spdk_bs_load_write_used_md(seq, ctx, bserrno);
 	}
 }
@@ -2996,9 +3209,8 @@ _spdk_bs_load_replay_md(spdk_bs_sequence_t *seq, void *cb_arg)
 
 	ctx->page_index = 0;
 	ctx->cur_page = 0;
-	ctx->page = spdk_dma_zmalloc(SPDK_BS_PAGE_SIZE,
-				     SPDK_BS_PAGE_SIZE,
-				     NULL);
+	ctx->page = spdk_zmalloc(SPDK_BS_PAGE_SIZE, SPDK_BS_PAGE_SIZE,
+				 NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 	if (!ctx->page) {
 		_spdk_bs_load_ctx_fail(seq, ctx, -ENOMEM);
 		return;
@@ -3039,6 +3251,7 @@ _spdk_bs_load_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_bs_load_ctx *ctx = cb_arg;
 	uint32_t	crc;
+	int		rc;
 	static const char zeros[SPDK_BLOBSTORE_TYPE_LENGTH];
 
 	if (ctx->super->version > SPDK_BS_VERSION ||
@@ -3065,31 +3278,41 @@ _spdk_bs_load_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		SPDK_DEBUGLOG(SPDK_LOG_BLOB, "Bstype wildcard used - loading blobstore regardless bstype\n");
 	} else {
 		SPDK_DEBUGLOG(SPDK_LOG_BLOB, "Unexpected bstype\n");
-		SPDK_TRACEDUMP(SPDK_LOG_BLOB, "Expected:", ctx->bs->bstype.bstype, SPDK_BLOBSTORE_TYPE_LENGTH);
-		SPDK_TRACEDUMP(SPDK_LOG_BLOB, "Found:", ctx->super->bstype.bstype, SPDK_BLOBSTORE_TYPE_LENGTH);
+		SPDK_LOGDUMP(SPDK_LOG_BLOB, "Expected:", ctx->bs->bstype.bstype, SPDK_BLOBSTORE_TYPE_LENGTH);
+		SPDK_LOGDUMP(SPDK_LOG_BLOB, "Found:", ctx->super->bstype.bstype, SPDK_BLOBSTORE_TYPE_LENGTH);
 		_spdk_bs_load_ctx_fail(seq, ctx, -ENXIO);
 		return;
 	}
 
-	if (ctx->super->size == 0) {
-		/* Update number of blocks for blobstore */
-		ctx->bs->total_clusters = ctx->bs->dev->blockcnt * ctx->bs->dev->blocklen / ctx->bs->cluster_sz;
-	} else if (ctx->super->size > ctx->bs->dev->blockcnt * ctx->bs->dev->blocklen) {
+	if (ctx->super->size > ctx->bs->dev->blockcnt * ctx->bs->dev->blocklen) {
 		SPDK_NOTICELOG("Size mismatch, dev size: %lu, blobstore size: %lu\n",
 			       ctx->bs->dev->blockcnt * ctx->bs->dev->blocklen, ctx->super->size);
 		_spdk_bs_load_ctx_fail(seq, ctx, -EILSEQ);
 		return;
-	} else {
-		ctx->bs->total_clusters = ctx->super->size / ctx->bs->cluster_sz;
+	}
+
+	if (ctx->super->size == 0) {
+		ctx->super->size = ctx->bs->dev->blockcnt * ctx->bs->dev->blocklen;
+	}
+
+	if (ctx->super->io_unit_size == 0) {
+		ctx->super->io_unit_size = SPDK_BS_PAGE_SIZE;
 	}
 
 	/* Parse the super block */
 	ctx->bs->clean = 1;
 	ctx->bs->cluster_sz = ctx->super->cluster_size;
+	ctx->bs->total_clusters = ctx->super->size / ctx->super->cluster_size;
 	ctx->bs->pages_per_cluster = ctx->bs->cluster_sz / SPDK_BS_PAGE_SIZE;
+	ctx->bs->io_unit_size = ctx->super->io_unit_size;
+	rc = spdk_bit_array_resize(&ctx->bs->used_clusters, ctx->bs->total_clusters);
+	if (rc < 0) {
+		_spdk_bs_load_ctx_fail(seq, ctx, -ENOMEM);
+		return;
+	}
 	ctx->bs->md_start = ctx->super->md_start;
 	ctx->bs->md_len = ctx->super->md_len;
-	ctx->bs->total_data_clusters = ctx->bs->total_clusters - divide_round_up(
+	ctx->bs->total_data_clusters = ctx->bs->total_clusters - spdk_divide_round_up(
 					       ctx->bs->md_start + ctx->bs->md_len, ctx->bs->pages_per_cluster);
 	ctx->bs->super_blob = ctx->super->super_blob;
 	memcpy(&ctx->bs->bstype, &ctx->super->bstype, sizeof(ctx->super->bstype));
@@ -3110,6 +3333,7 @@ spdk_bs_load(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	spdk_bs_sequence_t	*seq;
 	struct spdk_bs_load_ctx *ctx;
 	struct spdk_bs_opts	opts = {};
+	int err;
 
 	SPDK_DEBUGLOG(SPDK_LOG_BLOB, "Loading blobstore from dev %p\n", dev);
 
@@ -3132,10 +3356,10 @@ spdk_bs_load(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 		return;
 	}
 
-	bs = _spdk_bs_alloc(dev, &opts);
-	if (!bs) {
+	err = _spdk_bs_alloc(dev, &opts, &bs);
+	if (err) {
 		dev->destroy(dev);
-		cb_fn(cb_arg, NULL, -ENOMEM);
+		cb_fn(cb_arg, NULL, err);
 		return;
 	}
 
@@ -3147,12 +3371,12 @@ spdk_bs_load(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	}
 
 	ctx->bs = bs;
-	ctx->is_load = true;
 	ctx->iter_cb_fn = opts.iter_cb_fn;
 	ctx->iter_cb_arg = opts.iter_cb_arg;
 
 	/* Allocate memory for the super block */
-	ctx->super = spdk_dma_zmalloc(sizeof(*ctx->super), 0x1000, NULL);
+	ctx->super = spdk_zmalloc(sizeof(*ctx->super), 0x1000, NULL,
+				  SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 	if (!ctx->super) {
 		free(ctx);
 		_spdk_bs_free(bs);
@@ -3167,7 +3391,7 @@ spdk_bs_load(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 
 	seq = spdk_bs_sequence_start(bs->md_channel, &cpl);
 	if (!seq) {
-		spdk_dma_free(ctx->super);
+		spdk_free(ctx->super);
 		free(ctx);
 		_spdk_bs_free(bs);
 		cb_fn(cb_arg, NULL, -ENOMEM);
@@ -3198,11 +3422,11 @@ struct spdk_bs_dump_ctx {
 static void
 _spdk_bs_dump_finish(spdk_bs_sequence_t *seq, struct spdk_bs_dump_ctx *ctx, int bserrno)
 {
-	spdk_dma_free(ctx->super);
+	spdk_free(ctx->super);
 
 	/*
 	 * We need to defer calling spdk_bs_call_cpl() until after
-	 * dev destuction, so tuck these away for later use.
+	 * dev destruction, so tuck these away for later use.
 	 */
 	ctx->bs->unload_err = bserrno;
 	memcpy(&ctx->bs->unload_cpl, &seq->cpl, sizeof(struct spdk_bs_cpl));
@@ -3238,20 +3462,20 @@ _spdk_bs_dump_print_md_page(struct spdk_bs_dump_ctx *ctx)
 				/* If padding and length are 0, this terminates the page */
 				break;
 			}
-		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_EXTENT) {
-			struct spdk_blob_md_descriptor_extent	*desc_extent;
+		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_EXTENT_RLE) {
+			struct spdk_blob_md_descriptor_extent_rle	*desc_extent_rle;
 			unsigned int				i;
 
-			desc_extent = (struct spdk_blob_md_descriptor_extent *)desc;
+			desc_extent_rle = (struct spdk_blob_md_descriptor_extent_rle *)desc;
 
-			for (i = 0; i < desc_extent->length / sizeof(desc_extent->extents[0]); i++) {
-				if (desc_extent->extents[i].cluster_idx != 0) {
+			for (i = 0; i < desc_extent_rle->length / sizeof(desc_extent_rle->extents[0]); i++) {
+				if (desc_extent_rle->extents[i].cluster_idx != 0) {
 					fprintf(ctx->fp, "Allocated Extent - Start: %" PRIu32,
-						desc_extent->extents[i].cluster_idx);
+						desc_extent_rle->extents[i].cluster_idx);
 				} else {
 					fprintf(ctx->fp, "Unallocated Extent - ");
 				}
-				fprintf(ctx->fp, " Length: %" PRIu32, desc_extent->extents[i].length);
+				fprintf(ctx->fp, " Length: %" PRIu32, desc_extent_rle->extents[i].length);
 				fprintf(ctx->fp, "\n");
 			}
 		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_XATTR) {
@@ -3320,7 +3544,7 @@ _spdk_bs_dump_read_md_page_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrn
 	if (ctx->cur_page < ctx->super->md_len) {
 		_spdk_bs_dump_read_md_page(seq, cb_arg);
 	} else {
-		spdk_dma_free(ctx->page);
+		spdk_free(ctx->page);
 		_spdk_bs_dump_finish(seq, ctx, 0);
 	}
 }
@@ -3374,9 +3598,8 @@ _spdk_bs_dump_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	fprintf(ctx->fp, "Metadata Length: %" PRIu32 "\n", ctx->super->md_len);
 
 	ctx->cur_page = 0;
-	ctx->page = spdk_dma_zmalloc(SPDK_BS_PAGE_SIZE,
-				     SPDK_BS_PAGE_SIZE,
-				     NULL);
+	ctx->page = spdk_zmalloc(SPDK_BS_PAGE_SIZE, SPDK_BS_PAGE_SIZE,
+				 NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 	if (!ctx->page) {
 		_spdk_bs_dump_finish(seq, ctx, -ENOMEM);
 		return;
@@ -3393,15 +3616,16 @@ spdk_bs_dump(struct spdk_bs_dev *dev, FILE *fp, spdk_bs_dump_print_xattr print_x
 	spdk_bs_sequence_t	*seq;
 	struct spdk_bs_dump_ctx *ctx;
 	struct spdk_bs_opts	opts = {};
+	int err;
 
 	SPDK_DEBUGLOG(SPDK_LOG_BLOB, "Dumping blobstore from dev %p\n", dev);
 
 	spdk_bs_opts_init(&opts);
 
-	bs = _spdk_bs_alloc(dev, &opts);
-	if (!bs) {
+	err = _spdk_bs_alloc(dev, &opts, &bs);
+	if (err) {
 		dev->destroy(dev);
-		cb_fn(cb_arg, -ENOMEM);
+		cb_fn(cb_arg, err);
 		return;
 	}
 
@@ -3417,7 +3641,8 @@ spdk_bs_dump(struct spdk_bs_dev *dev, FILE *fp, spdk_bs_dump_print_xattr print_x
 	ctx->print_xattr_fn = print_xattr_fn;
 
 	/* Allocate memory for the super block */
-	ctx->super = spdk_dma_zmalloc(sizeof(*ctx->super), 0x1000, NULL);
+	ctx->super = spdk_zmalloc(sizeof(*ctx->super), 0x1000, NULL,
+				  SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 	if (!ctx->super) {
 		free(ctx);
 		_spdk_bs_free(bs);
@@ -3431,7 +3656,7 @@ spdk_bs_dump(struct spdk_bs_dev *dev, FILE *fp, spdk_bs_dump_print_xattr print_x
 
 	seq = spdk_bs_sequence_start(bs->md_channel, &cpl);
 	if (!seq) {
-		spdk_dma_free(ctx->super);
+		spdk_free(ctx->super);
 		free(ctx);
 		_spdk_bs_free(bs);
 		cb_fn(cb_arg, -ENOMEM);
@@ -3458,7 +3683,7 @@ _spdk_bs_init_persist_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserr
 {
 	struct spdk_bs_init_ctx *ctx = cb_arg;
 
-	spdk_dma_free(ctx->super);
+	spdk_free(ctx->super);
 	free(ctx);
 
 	spdk_bs_sequence_finish(seq, bserrno);
@@ -3513,10 +3738,10 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 		return;
 	}
 
-	bs = _spdk_bs_alloc(dev, &opts);
-	if (!bs) {
+	rc = _spdk_bs_alloc(dev, &opts, &bs);
+	if (rc) {
 		dev->destroy(dev);
-		cb_fn(cb_arg, NULL, -ENOMEM);
+		cb_fn(cb_arg, NULL, rc);
 		return;
 	}
 
@@ -3531,7 +3756,6 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	} else {
 		bs->md_len = opts.num_md_pages;
 	}
-
 	rc = spdk_bit_array_resize(&bs->used_md_pages, bs->md_len);
 	if (rc < 0) {
 		_spdk_bs_free(bs);
@@ -3556,7 +3780,8 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	ctx->bs = bs;
 
 	/* Allocate memory for the super block */
-	ctx->super = spdk_dma_zmalloc(sizeof(*ctx->super), 0x1000, NULL);
+	ctx->super = spdk_zmalloc(sizeof(*ctx->super), 0x1000, NULL,
+				  SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 	if (!ctx->super) {
 		free(ctx);
 		_spdk_bs_free(bs);
@@ -3570,6 +3795,7 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	ctx->super->super_blob = bs->super_blob;
 	ctx->super->clean = 0;
 	ctx->super->cluster_size = bs->cluster_sz;
+	ctx->super->io_unit_size = bs->io_unit_size;
 	memcpy(&ctx->super->bstype, &bs->bstype, sizeof(bs->bstype));
 
 	/* Calculate how many pages the metadata consumes at the front
@@ -3583,8 +3809,8 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	 * up to the nearest page, plus a header.
 	 */
 	ctx->super->used_page_mask_start = num_md_pages;
-	ctx->super->used_page_mask_len = divide_round_up(sizeof(struct spdk_bs_md_mask) +
-					 divide_round_up(bs->md_len, 8),
+	ctx->super->used_page_mask_len = spdk_divide_round_up(sizeof(struct spdk_bs_md_mask) +
+					 spdk_divide_round_up(bs->md_len, 8),
 					 SPDK_BS_PAGE_SIZE);
 	num_md_pages += ctx->super->used_page_mask_len;
 
@@ -3592,8 +3818,8 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	 * up to the nearest page, plus a header.
 	 */
 	ctx->super->used_cluster_mask_start = num_md_pages;
-	ctx->super->used_cluster_mask_len = divide_round_up(sizeof(struct spdk_bs_md_mask) +
-					    divide_round_up(bs->total_clusters, 8),
+	ctx->super->used_cluster_mask_len = spdk_divide_round_up(sizeof(struct spdk_bs_md_mask) +
+					    spdk_divide_round_up(bs->total_clusters, 8),
 					    SPDK_BS_PAGE_SIZE);
 	num_md_pages += ctx->super->used_cluster_mask_len;
 
@@ -3601,8 +3827,8 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	 * up to the nearest page, plus a header.
 	 */
 	ctx->super->used_blobid_mask_start = num_md_pages;
-	ctx->super->used_blobid_mask_len = divide_round_up(sizeof(struct spdk_bs_md_mask) +
-					   divide_round_up(bs->md_len, 8),
+	ctx->super->used_blobid_mask_len = spdk_divide_round_up(sizeof(struct spdk_bs_md_mask) +
+					   spdk_divide_round_up(bs->md_len, 8),
 					   SPDK_BS_PAGE_SIZE);
 	num_md_pages += ctx->super->used_blobid_mask_len;
 
@@ -3617,12 +3843,12 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 
 	ctx->super->crc = _spdk_blob_md_page_calc_crc(ctx->super);
 
-	num_md_clusters = divide_round_up(num_md_pages, bs->pages_per_cluster);
+	num_md_clusters = spdk_divide_round_up(num_md_pages, bs->pages_per_cluster);
 	if (num_md_clusters > bs->total_clusters) {
 		SPDK_ERRLOG("Blobstore metadata cannot use more clusters than is available, "
 			    "please decrease number of pages reserved for metadata "
 			    "or increase cluster size.\n");
-		spdk_dma_free(ctx->super);
+		spdk_free(ctx->super);
 		free(ctx);
 		_spdk_bs_free(bs);
 		cb_fn(cb_arg, NULL, -ENOMEM);
@@ -3642,7 +3868,7 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 
 	seq = spdk_bs_sequence_start(bs->md_channel, &cpl);
 	if (!seq) {
-		spdk_dma_free(ctx->super);
+		spdk_free(ctx->super);
 		free(ctx);
 		_spdk_bs_free(bs);
 		cb_fn(cb_arg, NULL, -ENOMEM);
@@ -3653,8 +3879,14 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 
 	/* Clear metadata space */
 	spdk_bs_batch_write_zeroes_dev(batch, 0, num_md_lba);
-	/* Trim data clusters */
-	spdk_bs_batch_unmap_dev(batch, num_md_lba, ctx->bs->dev->blockcnt - num_md_lba);
+
+	if (opts.clear_method == BS_CLEAR_WITH_UNMAP) {
+		/* Trim data clusters */
+		spdk_bs_batch_unmap_dev(batch, num_md_lba, ctx->bs->dev->blockcnt - num_md_lba);
+	} else if (opts.clear_method == BS_CLEAR_WITH_WRITE_ZEROES) {
+		/* Write_zeroes to data clusters */
+		spdk_bs_batch_write_zeroes_dev(batch, num_md_lba, ctx->bs->dev->blockcnt - num_md_lba);
+	}
 
 	spdk_bs_batch_close(batch);
 }
@@ -3734,11 +3966,11 @@ _spdk_bs_unload_write_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserr
 {
 	struct spdk_bs_load_ctx	*ctx = cb_arg;
 
-	spdk_dma_free(ctx->super);
+	spdk_free(ctx->super);
 
 	/*
 	 * We need to defer calling spdk_bs_call_cpl() until after
-	 * dev destuction, so tuck these away for later use.
+	 * dev destruction, so tuck these away for later use.
 	 */
 	ctx->bs->unload_err = bserrno;
 	memcpy(&ctx->bs->unload_cpl, &seq->cpl, sizeof(struct spdk_bs_cpl));
@@ -3755,7 +3987,7 @@ _spdk_bs_unload_write_used_clusters_cpl(spdk_bs_sequence_t *seq, void *cb_arg, i
 {
 	struct spdk_bs_load_ctx	*ctx = cb_arg;
 
-	spdk_dma_free(ctx->mask);
+	spdk_free(ctx->mask);
 	ctx->super->clean = 1;
 
 	_spdk_bs_write_super(seq, ctx->bs, ctx->super, _spdk_bs_unload_write_super_cpl, ctx);
@@ -3766,7 +3998,7 @@ _spdk_bs_unload_write_used_blobids_cpl(spdk_bs_sequence_t *seq, void *cb_arg, in
 {
 	struct spdk_bs_load_ctx	*ctx = cb_arg;
 
-	spdk_dma_free(ctx->mask);
+	spdk_free(ctx->mask);
 	ctx->mask = NULL;
 
 	_spdk_bs_write_used_clusters(seq, cb_arg, _spdk_bs_unload_write_used_clusters_cpl);
@@ -3777,7 +4009,7 @@ _spdk_bs_unload_write_used_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int 
 {
 	struct spdk_bs_load_ctx	*ctx = cb_arg;
 
-	spdk_dma_free(ctx->mask);
+	spdk_free(ctx->mask);
 	ctx->mask = NULL;
 
 	_spdk_bs_write_used_blobids(seq, cb_arg, _spdk_bs_unload_write_used_blobids_cpl);
@@ -3811,9 +4043,9 @@ spdk_bs_unload(struct spdk_blob_store *bs, spdk_bs_op_complete cb_fn, void *cb_a
 	}
 
 	ctx->bs = bs;
-	ctx->is_load = false;
 
-	ctx->super = spdk_dma_zmalloc(sizeof(*ctx->super), 0x1000, NULL);
+	ctx->super = spdk_zmalloc(sizeof(*ctx->super), 0x1000, NULL,
+				  SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 	if (!ctx->super) {
 		free(ctx);
 		cb_fn(cb_arg, -ENOMEM);
@@ -3826,7 +4058,7 @@ spdk_bs_unload(struct spdk_blob_store *bs, spdk_bs_op_complete cb_fn, void *cb_a
 
 	seq = spdk_bs_sequence_start(bs->md_channel, &cpl);
 	if (!seq) {
-		spdk_dma_free(ctx->super);
+		spdk_free(ctx->super);
 		free(ctx);
 		cb_fn(cb_arg, -ENOMEM);
 		return;
@@ -3856,7 +4088,7 @@ _spdk_bs_set_super_write_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		SPDK_ERRLOG("Unable to write to super block of blobstore\n");
 	}
 
-	spdk_dma_free(ctx->super);
+	spdk_free(ctx->super);
 
 	spdk_bs_sequence_finish(seq, bserrno);
 
@@ -3870,7 +4102,7 @@ _spdk_bs_set_super_read_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 
 	if (bserrno != 0) {
 		SPDK_ERRLOG("Unable to read super block of blobstore\n");
-		spdk_dma_free(ctx->super);
+		spdk_free(ctx->super);
 		spdk_bs_sequence_finish(seq, bserrno);
 		free(ctx);
 		return;
@@ -3897,7 +4129,8 @@ spdk_bs_set_super(struct spdk_blob_store *bs, spdk_blob_id blobid,
 
 	ctx->bs = bs;
 
-	ctx->super = spdk_dma_zmalloc(sizeof(*ctx->super), 0x1000, NULL);
+	ctx->super = spdk_zmalloc(sizeof(*ctx->super), 0x1000, NULL,
+				  SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 	if (!ctx->super) {
 		free(ctx);
 		cb_fn(cb_arg, -ENOMEM);
@@ -3910,7 +4143,7 @@ spdk_bs_set_super(struct spdk_blob_store *bs, spdk_blob_id blobid,
 
 	seq = spdk_bs_sequence_start(bs->md_channel, &cpl);
 	if (!seq) {
-		spdk_dma_free(ctx->super);
+		spdk_free(ctx->super);
 		free(ctx);
 		cb_fn(cb_arg, -ENOMEM);
 		return;
@@ -3947,6 +4180,12 @@ uint64_t
 spdk_bs_get_page_size(struct spdk_blob_store *bs)
 {
 	return SPDK_BS_PAGE_SIZE;
+}
+
+uint64_t
+spdk_bs_get_io_unit_size(struct spdk_blob_store *bs)
+{
+	return bs->io_unit_size;
 }
 
 uint64_t
@@ -3995,6 +4234,13 @@ uint64_t spdk_blob_get_num_pages(struct spdk_blob *blob)
 	return _spdk_bs_cluster_to_page(blob->bs, blob->active.num_clusters);
 }
 
+uint64_t spdk_blob_get_num_io_units(struct spdk_blob *blob)
+{
+	assert(blob != NULL);
+
+	return spdk_blob_get_num_pages(blob) * _spdk_bs_io_unit_per_page(blob->bs);
+}
+
 uint64_t spdk_blob_get_num_clusters(struct spdk_blob *blob)
 {
 	assert(blob != NULL);
@@ -4039,14 +4285,6 @@ _spdk_blob_set_xattrs(struct spdk_blob *blob, const struct spdk_blob_xattr_opts 
 }
 
 static void
-_spdk_blob_set_thin_provision(struct spdk_blob *blob)
-{
-	_spdk_blob_verify_md_op(blob);
-	blob->invalid_flags |= SPDK_BLOB_THIN_PROV;
-	blob->state = SPDK_BLOB_STATE_DIRTY;
-}
-
-static void
 _spdk_bs_create_blob(struct spdk_blob_store *bs,
 		     const struct spdk_blob_opts *opts,
 		     const struct spdk_blob_xattr_opts *internal_xattrs,
@@ -4064,7 +4302,7 @@ _spdk_bs_create_blob(struct spdk_blob_store *bs,
 	assert(spdk_get_thread() == bs->md_thread);
 
 	page_idx = spdk_bit_array_find_first_clear(bs->used_md_pages, 0);
-	if (page_idx >= spdk_bit_array_capacity(bs->used_md_pages)) {
+	if (page_idx == UINT32_MAX) {
 		cb_fn(cb_arg, 0, -ENOMEM);
 		return;
 	}
@@ -4217,6 +4455,8 @@ _spdk_bs_snapshot_unfreeze_cpl(void *cb_arg, int bserrno)
 	}
 
 	ctx->original.id = origblob->id;
+	origblob->locked_operation_in_progress = false;
+
 	spdk_blob_close(origblob, _spdk_bs_clone_snapshot_cleanup_finish, ctx);
 }
 
@@ -4266,13 +4506,25 @@ _spdk_bs_clone_snapshot_newblob_cleanup(void *cb_arg, int bserrno)
 /* START spdk_bs_create_snapshot */
 
 static void
+_spdk_bs_snapshot_swap_cluster_maps(struct spdk_blob *blob1, struct spdk_blob *blob2)
+{
+	uint64_t *cluster_temp;
+
+	cluster_temp = blob1->active.clusters;
+	blob1->active.clusters = blob2->active.clusters;
+	blob2->active.clusters = cluster_temp;
+}
+
+static void
 _spdk_bs_snapshot_origblob_sync_cpl(void *cb_arg, int bserrno)
 {
 	struct spdk_clone_snapshot_ctx *ctx = (struct spdk_clone_snapshot_ctx *)cb_arg;
+	struct spdk_blob *origblob = ctx->original.blob;
 	struct spdk_blob *newblob = ctx->new.blob;
 
 	if (bserrno != 0) {
-		_spdk_bs_clone_snapshot_newblob_cleanup(ctx, bserrno);
+		_spdk_bs_snapshot_swap_cluster_maps(newblob, origblob);
+		_spdk_bs_clone_snapshot_origblob_cleanup(ctx, bserrno);
 		return;
 	}
 
@@ -4299,6 +4551,8 @@ _spdk_bs_snapshot_newblob_sync_cpl(void *cb_arg, int bserrno)
 	struct spdk_blob *newblob = ctx->new.blob;
 
 	if (bserrno != 0) {
+		/* return cluster map back to original */
+		_spdk_bs_snapshot_swap_cluster_maps(newblob, origblob);
 		_spdk_bs_clone_snapshot_newblob_cleanup(ctx, bserrno);
 		return;
 	}
@@ -4306,6 +4560,8 @@ _spdk_bs_snapshot_newblob_sync_cpl(void *cb_arg, int bserrno)
 	/* Set internal xattr for snapshot id */
 	bserrno = _spdk_blob_set_xattr(origblob, BLOB_SNAPSHOT, &newblob->id, sizeof(spdk_blob_id), true);
 	if (bserrno != 0) {
+		/* return cluster map back to original */
+		_spdk_bs_snapshot_swap_cluster_maps(newblob, origblob);
 		_spdk_bs_clone_snapshot_newblob_cleanup(ctx, bserrno);
 		return;
 	}
@@ -4316,6 +4572,8 @@ _spdk_bs_snapshot_newblob_sync_cpl(void *cb_arg, int bserrno)
 	/* Create new back_bs_dev for snapshot */
 	origblob->back_bs_dev = spdk_bs_create_blob_bs_dev(newblob);
 	if (origblob->back_bs_dev == NULL) {
+		/* return cluster map back to original */
+		_spdk_bs_snapshot_swap_cluster_maps(newblob, origblob);
 		_spdk_bs_clone_snapshot_newblob_cleanup(ctx, -EINVAL);
 		return;
 	}
@@ -4324,10 +4582,6 @@ _spdk_bs_snapshot_newblob_sync_cpl(void *cb_arg, int bserrno)
 	_spdk_blob_set_thin_provision(origblob);
 
 	_spdk_bs_blob_list_add(newblob);
-
-	/* Zero out origblob cluster map */
-	memset(origblob->active.clusters, 0,
-	       origblob->active.num_clusters * sizeof(origblob->active.clusters));
 
 	/* sync clone metadata */
 	spdk_blob_sync_md(origblob, _spdk_bs_snapshot_origblob_sync_cpl, ctx);
@@ -4365,9 +4619,8 @@ _spdk_bs_snapshot_freeze_cpl(void *cb_arg, int rc)
 		}
 	}
 
-	/* Copy cluster map to snapshot */
-	memcpy(newblob->active.clusters, origblob->active.clusters,
-	       origblob->active.num_clusters * sizeof(origblob->active.clusters));
+	/* swap cluster maps */
+	_spdk_bs_snapshot_swap_cluster_maps(newblob, origblob);
 
 	/* sync snapshot metadata */
 	spdk_blob_sync_md(newblob, _spdk_bs_snapshot_newblob_sync_cpl, ctx);
@@ -4386,6 +4639,10 @@ _spdk_bs_snapshot_newblob_open_cpl(void *cb_arg, struct spdk_blob *_blob, int bs
 	}
 
 	ctx->new.blob = newblob;
+
+	/* Zero out newblob cluster map */
+	memset(newblob->active.clusters, 0,
+	       newblob->active.num_clusters * sizeof(newblob->active.clusters));
 
 	_spdk_blob_freeze_io(origblob, _spdk_bs_snapshot_freeze_cpl, ctx);
 }
@@ -4437,9 +4694,19 @@ _spdk_bs_snapshot_origblob_open_cpl(void *cb_arg, struct spdk_blob *_blob, int b
 	if (_blob->data_ro || _blob->md_ro) {
 		SPDK_DEBUGLOG(SPDK_LOG_BLOB, "Cannot create snapshot from read only blob with id %lu\n",
 			      _blob->id);
-		_spdk_bs_clone_snapshot_origblob_cleanup(ctx, -EINVAL);
+		ctx->bserrno = -EINVAL;
+		spdk_blob_close(_blob, _spdk_bs_clone_snapshot_cleanup_finish, ctx);
 		return;
 	}
+
+	if (_blob->locked_operation_in_progress) {
+		SPDK_DEBUGLOG(SPDK_LOG_BLOB, "Cannot create snapshot - another operation in progress\n");
+		ctx->bserrno = -EBUSY;
+		spdk_blob_close(_blob, _spdk_bs_clone_snapshot_cleanup_finish, ctx);
+		return;
+	}
+
+	_blob->locked_operation_in_progress = true;
 
 	spdk_blob_opts_init(&opts);
 	_spdk_blob_xattrs_init(&internal_xattrs);
@@ -4537,9 +4804,19 @@ _spdk_bs_clone_origblob_open_cpl(void *cb_arg, struct spdk_blob *_blob, int bser
 
 	if (!_blob->data_ro || !_blob->md_ro) {
 		SPDK_DEBUGLOG(SPDK_LOG_BLOB, "Clone not from read-only blob\n");
-		_spdk_bs_clone_snapshot_origblob_cleanup(ctx, -EINVAL);
+		ctx->bserrno = -EINVAL;
+		spdk_blob_close(_blob, _spdk_bs_clone_snapshot_cleanup_finish, ctx);
 		return;
 	}
+
+	if (_blob->locked_operation_in_progress) {
+		SPDK_DEBUGLOG(SPDK_LOG_BLOB, "Cannot create clone - another operation in progress\n");
+		ctx->bserrno = -EBUSY;
+		spdk_blob_close(_blob, _spdk_bs_clone_snapshot_cleanup_finish, ctx);
+		return;
+	}
+
+	_blob->locked_operation_in_progress = true;
 
 	spdk_blob_opts_init(&opts);
 	_spdk_blob_xattrs_init(&internal_xattrs);
@@ -4692,7 +4969,7 @@ _spdk_bs_inflate_blob_touch_next(void *cb_arg, int bserrno)
 	}
 
 	if (ctx->cluster < _blob->active.num_clusters) {
-		offset = _spdk_bs_cluster_to_page(_blob->bs, ctx->cluster);
+		offset = _spdk_bs_cluster_to_lba(_blob->bs, ctx->cluster);
 
 		/* We may safely increment a cluster before write */
 		ctx->cluster++;
@@ -4716,7 +4993,17 @@ _spdk_bs_inflate_blob_open_cpl(void *cb_arg, struct spdk_blob *_blob, int bserrn
 		_spdk_bs_clone_snapshot_cleanup_finish(ctx, bserrno);
 		return;
 	}
+
 	ctx->original.blob = _blob;
+
+	if (_blob->locked_operation_in_progress) {
+		SPDK_DEBUGLOG(SPDK_LOG_BLOB, "Cannot inflate blob - another operation in progress\n");
+		ctx->bserrno = -EBUSY;
+		spdk_blob_close(_blob, _spdk_bs_clone_snapshot_cleanup_finish, ctx);
+		return;
+	}
+
+	_blob->locked_operation_in_progress = true;
 
 	if (!ctx->allocate_all && _blob->parent_id == SPDK_BLOBID_INVALID) {
 		/* This blob have no parent, so we cannot decouple it. */
@@ -4738,7 +5025,7 @@ _spdk_bs_inflate_blob_open_cpl(void *cb_arg, struct spdk_blob *_blob, int bserrn
 	for (i = 0; i < _blob->active.num_clusters; i++) {
 		if (_spdk_bs_cluster_needs_allocation(_blob, i, ctx->allocate_all)) {
 			lfc = spdk_bit_array_find_first_clear(_blob->bs->used_clusters, lfc);
-			if (lfc >= _blob->bs->total_clusters) {
+			if (lfc == UINT32_MAX) {
 				/* No more free clusters. Cannot satisfy the request */
 				_spdk_bs_clone_snapshot_origblob_cleanup(ctx, -ENOSPC);
 				return;
@@ -4810,7 +5097,7 @@ _spdk_bs_resize_unfreeze_cpl(void *cb_arg, int rc)
 		rc = ctx->rc;
 	}
 
-	ctx->blob->resize_in_progress = false;
+	ctx->blob->locked_operation_in_progress = false;
 
 	ctx->cb_fn(ctx->cb_arg, rc);
 	free(ctx);
@@ -4822,7 +5109,7 @@ _spdk_bs_resize_freeze_cpl(void *cb_arg, int rc)
 	struct spdk_bs_resize_ctx *ctx = (struct spdk_bs_resize_ctx *)cb_arg;
 
 	if (rc != 0) {
-		ctx->blob->resize_in_progress = false;
+		ctx->blob->locked_operation_in_progress = false;
 		ctx->cb_fn(ctx->cb_arg, rc);
 		free(ctx);
 		return;
@@ -4852,7 +5139,7 @@ spdk_blob_resize(struct spdk_blob *blob, uint64_t sz, spdk_blob_op_complete cb_f
 		return;
 	}
 
-	if (blob->resize_in_progress) {
+	if (blob->locked_operation_in_progress) {
 		cb_fn(cb_arg, -EBUSY);
 		return;
 	}
@@ -4863,7 +5150,7 @@ spdk_blob_resize(struct spdk_blob *blob, uint64_t sz, spdk_blob_op_complete cb_f
 		return;
 	}
 
-	blob->resize_in_progress = true;
+	blob->locked_operation_in_progress = true;
 	ctx->cb_fn = cb_fn;
 	ctx->cb_arg = cb_arg;
 	ctx->blob = blob;
@@ -4910,41 +5197,321 @@ _spdk_bs_delete_persist_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	spdk_blob_close(blob, _spdk_bs_delete_close_cpl, seq);
 }
 
+struct delete_snapshot_ctx {
+	struct spdk_blob_list *parent_snapshot_entry;
+	struct spdk_blob *snapshot;
+	bool snapshot_md_ro;
+	struct spdk_blob *clone;
+	bool clone_md_ro;
+	spdk_blob_op_with_handle_complete cb_fn;
+	void *cb_arg;
+	int bserrno;
+};
+
 static void
-_spdk_bs_delete_open_cpl(void *cb_arg, struct spdk_blob *blob, int bserrno)
+_spdk_delete_blob_cleanup_finish(void *cb_arg, int bserrno)
+{
+	struct delete_snapshot_ctx *ctx = cb_arg;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("Snapshot cleanup error %d\n", bserrno);
+	}
+
+	assert(ctx != NULL);
+
+	if (bserrno != 0 && ctx->bserrno == 0) {
+		ctx->bserrno = bserrno;
+	}
+
+	ctx->cb_fn(ctx->cb_arg, ctx->snapshot, ctx->bserrno);
+	free(ctx);
+}
+
+static void
+_spdk_delete_snapshot_cleanup_snapshot(void *cb_arg, int bserrno)
+{
+	struct delete_snapshot_ctx *ctx = cb_arg;
+
+	if (bserrno != 0) {
+		ctx->bserrno = bserrno;
+		SPDK_ERRLOG("Clone cleanup error %d\n", bserrno);
+	}
+
+	/* open_ref == 1 menas that only deletion context has opened this snapshot
+	 * open_ref == 2 menas that clone has opened this snapshot as well,
+	 * so we have to add it back to the blobs list */
+	if (ctx->snapshot->open_ref == 2) {
+		TAILQ_INSERT_HEAD(&ctx->snapshot->bs->blobs, ctx->snapshot, link);
+	}
+
+	ctx->snapshot->locked_operation_in_progress = false;
+	ctx->snapshot->md_ro = ctx->snapshot_md_ro;
+
+	spdk_blob_close(ctx->snapshot, _spdk_delete_blob_cleanup_finish, ctx);
+}
+
+static void
+_spdk_delete_snapshot_cleanup_clone(void *cb_arg, int bserrno)
+{
+	struct delete_snapshot_ctx *ctx = cb_arg;
+
+	ctx->clone->locked_operation_in_progress = false;
+	ctx->clone->md_ro = ctx->clone_md_ro;
+
+	spdk_blob_close(ctx->clone, _spdk_delete_snapshot_cleanup_snapshot, ctx);
+}
+
+static void
+_spdk_delete_snapshot_unfreeze_cpl(void *cb_arg, int bserrno)
+{
+	struct delete_snapshot_ctx *ctx = cb_arg;
+
+	if (bserrno) {
+		ctx->bserrno = bserrno;
+		_spdk_delete_snapshot_cleanup_clone(ctx, 0);
+		return;
+	}
+
+	ctx->clone->locked_operation_in_progress = false;
+	spdk_blob_close(ctx->clone, _spdk_delete_blob_cleanup_finish, ctx);
+}
+
+static void
+_spdk_delete_snapshot_sync_snapshot_cpl(void *cb_arg, int bserrno)
+{
+	struct delete_snapshot_ctx *ctx = cb_arg;
+	struct spdk_blob_list *parent_snapshot_entry = NULL;
+	struct spdk_blob_list *snapshot_entry = NULL;
+	struct spdk_blob_list *clone_entry = NULL;
+	struct spdk_blob_list *snapshot_clone_entry = NULL;
+
+	if (bserrno) {
+		SPDK_ERRLOG("Failed to sync MD on blob\n");
+		ctx->bserrno = bserrno;
+		_spdk_delete_snapshot_cleanup_clone(ctx, 0);
+		return;
+	}
+
+	/* Get snapshot entry for the snapshot we want to remove */
+	snapshot_entry = _spdk_bs_get_snapshot_entry(ctx->snapshot->bs, ctx->snapshot->id);
+
+	assert(snapshot_entry != NULL);
+
+	/* Remove clone entry in this snapshot (at this point there can be only one clone) */
+	clone_entry = TAILQ_FIRST(&snapshot_entry->clones);
+	assert(clone_entry != NULL);
+	TAILQ_REMOVE(&snapshot_entry->clones, clone_entry, link);
+	snapshot_entry->clone_count--;
+	assert(TAILQ_EMPTY(&snapshot_entry->clones));
+
+	if (ctx->snapshot->parent_id != SPDK_BLOBID_INVALID) {
+		/* This snapshot is at the same time a clone of another snapshot - we need to
+		 * update parent snapshot (remove current clone, add new one inherited from
+		 * the snapshot that is being removed) */
+
+		/* Get snapshot entry for parent snapshot and clone entry within that snapshot for
+		 * snapshot that we are removing */
+		_spdk_blob_get_snapshot_and_clone_entries(ctx->snapshot, &parent_snapshot_entry,
+				&snapshot_clone_entry);
+
+		/* Switch clone entry in parent snapshot */
+		TAILQ_INSERT_TAIL(&parent_snapshot_entry->clones, clone_entry, link);
+		TAILQ_REMOVE(&parent_snapshot_entry->clones, snapshot_clone_entry, link);
+		free(snapshot_clone_entry);
+	} else {
+		/* No parent snapshot - just remove clone entry */
+		free(clone_entry);
+	}
+
+	/* Restore md_ro flags */
+	ctx->clone->md_ro = ctx->clone_md_ro;
+	ctx->snapshot->md_ro = ctx->snapshot_md_ro;
+
+	_spdk_blob_unfreeze_io(ctx->clone, _spdk_delete_snapshot_unfreeze_cpl, ctx);
+}
+
+static void
+_spdk_delete_snapshot_sync_clone_cpl(void *cb_arg, int bserrno)
+{
+	struct delete_snapshot_ctx *ctx = cb_arg;
+	uint64_t i;
+
+	ctx->snapshot->md_ro = false;
+
+	if (bserrno) {
+		SPDK_ERRLOG("Failed to sync MD on clone\n");
+		ctx->bserrno = bserrno;
+
+		/* Restore snapshot to previous state */
+		bserrno = _spdk_blob_remove_xattr(ctx->snapshot, SNAPSHOT_PENDING_REMOVAL, true);
+		if (bserrno != 0) {
+			_spdk_delete_snapshot_cleanup_clone(ctx, bserrno);
+			return;
+		}
+
+		spdk_blob_sync_md(ctx->snapshot, _spdk_delete_snapshot_cleanup_clone, ctx);
+		return;
+	}
+
+	/* Clear cluster map entries for snapshot */
+	for (i = 0; i < ctx->snapshot->active.num_clusters && i < ctx->clone->active.num_clusters; i++) {
+		if (ctx->clone->active.clusters[i] == ctx->snapshot->active.clusters[i]) {
+			ctx->snapshot->active.clusters[i] = 0;
+		}
+	}
+
+	ctx->snapshot->state = SPDK_BLOB_STATE_DIRTY;
+
+	if (ctx->parent_snapshot_entry != NULL) {
+		ctx->snapshot->back_bs_dev = NULL;
+	}
+
+	spdk_blob_sync_md(ctx->snapshot, _spdk_delete_snapshot_sync_snapshot_cpl, ctx);
+}
+
+static void
+_spdk_delete_snapshot_sync_snapshot_xattr_cpl(void *cb_arg, int bserrno)
+{
+	struct delete_snapshot_ctx *ctx = cb_arg;
+	uint64_t i;
+
+	/* Temporarily override md_ro flag for clone for MD modification */
+	ctx->clone_md_ro = ctx->clone->md_ro;
+	ctx->clone->md_ro = false;
+
+	if (bserrno) {
+		SPDK_ERRLOG("Failed to sync MD with xattr on blob\n");
+		ctx->bserrno = bserrno;
+		_spdk_delete_snapshot_cleanup_clone(ctx, 0);
+		return;
+	}
+
+	/* Copy snapshot map to clone map (only unallocated clusters in clone) */
+	for (i = 0; i < ctx->snapshot->active.num_clusters && i < ctx->clone->active.num_clusters; i++) {
+		if (ctx->clone->active.clusters[i] == 0) {
+			ctx->clone->active.clusters[i] = ctx->snapshot->active.clusters[i];
+		}
+	}
+
+	/* Delete old backing bs_dev from clone (related to snapshot that will be removed) */
+	ctx->clone->back_bs_dev->destroy(ctx->clone->back_bs_dev);
+
+	/* Set/remove snapshot xattr and switch parent ID and backing bs_dev on clone... */
+	if (ctx->parent_snapshot_entry != NULL) {
+		/* ...to parent snapshot */
+		ctx->clone->parent_id = ctx->parent_snapshot_entry->id;
+		ctx->clone->back_bs_dev = ctx->snapshot->back_bs_dev;
+		_spdk_blob_set_xattr(ctx->clone, BLOB_SNAPSHOT, &ctx->parent_snapshot_entry->id,
+				     sizeof(spdk_blob_id),
+				     true);
+	} else {
+		/* ...to blobid invalid and zeroes dev */
+		ctx->clone->parent_id = SPDK_BLOBID_INVALID;
+		ctx->clone->back_bs_dev = spdk_bs_create_zeroes_dev();
+		_spdk_blob_remove_xattr(ctx->clone, BLOB_SNAPSHOT, true);
+	}
+
+	spdk_blob_sync_md(ctx->clone, _spdk_delete_snapshot_sync_clone_cpl, ctx);
+}
+
+static void
+_spdk_delete_snapshot_freeze_io_cb(void *cb_arg, int bserrno)
+{
+	struct delete_snapshot_ctx *ctx = cb_arg;
+
+	if (bserrno) {
+		SPDK_ERRLOG("Failed to freeze I/O on clone\n");
+		ctx->bserrno = bserrno;
+		_spdk_delete_snapshot_cleanup_clone(ctx, 0);
+		return;
+	}
+
+	/* Temporarily override md_ro flag for snapshot for MD modification */
+	ctx->snapshot_md_ro = ctx->snapshot->md_ro;
+	ctx->snapshot->md_ro = false;
+
+	/* Mark blob as pending for removal for power failure safety, use clone id for recovery */
+	ctx->bserrno = _spdk_blob_set_xattr(ctx->snapshot, SNAPSHOT_PENDING_REMOVAL, &ctx->clone->id,
+					    sizeof(spdk_blob_id), true);
+	if (ctx->bserrno != 0) {
+		_spdk_delete_snapshot_cleanup_clone(ctx, 0);
+		return;
+	}
+
+	spdk_blob_sync_md(ctx->snapshot, _spdk_delete_snapshot_sync_snapshot_xattr_cpl, ctx);
+}
+
+static void
+_spdk_delete_snapshot_open_clone_cb(void *cb_arg, struct spdk_blob *clone, int bserrno)
+{
+	struct delete_snapshot_ctx *ctx = cb_arg;
+
+	if (bserrno) {
+		SPDK_ERRLOG("Failed to open clone\n");
+		ctx->bserrno = bserrno;
+		_spdk_delete_snapshot_cleanup_snapshot(ctx, 0);
+		return;
+	}
+
+	ctx->clone = clone;
+
+	if (clone->locked_operation_in_progress) {
+		SPDK_DEBUGLOG(SPDK_LOG_BLOB, "Cannot remove blob - another operation in progress on its clone\n");
+		ctx->bserrno = -EBUSY;
+		spdk_blob_close(ctx->clone, _spdk_delete_snapshot_cleanup_snapshot, ctx);
+		return;
+	}
+
+	clone->locked_operation_in_progress = true;
+
+	_spdk_blob_freeze_io(clone, _spdk_delete_snapshot_freeze_io_cb, ctx);
+}
+
+static void
+_spdk_update_clone_on_snapshot_deletion(struct spdk_blob *snapshot, struct delete_snapshot_ctx *ctx)
+{
+	struct spdk_blob_list *snapshot_entry = NULL;
+	struct spdk_blob_list *clone_entry = NULL;
+	struct spdk_blob_list *snapshot_clone_entry = NULL;
+
+	/* Get snapshot entry for the snapshot we want to remove */
+	snapshot_entry = _spdk_bs_get_snapshot_entry(snapshot->bs, snapshot->id);
+
+	assert(snapshot_entry != NULL);
+
+	/* Get clone of the snapshot (at this point there can be only one clone) */
+	clone_entry = TAILQ_FIRST(&snapshot_entry->clones);
+	assert(snapshot_entry->clone_count == 1);
+	assert(clone_entry != NULL);
+
+	/* Get snapshot entry for parent snapshot and clone entry within that snapshot for
+	 * snapshot that we are removing */
+	_spdk_blob_get_snapshot_and_clone_entries(snapshot, &ctx->parent_snapshot_entry,
+			&snapshot_clone_entry);
+
+	spdk_bs_open_blob(snapshot->bs, clone_entry->id, _spdk_delete_snapshot_open_clone_cb, ctx);
+}
+
+static void
+_spdk_bs_delete_blob_finish(void *cb_arg, struct spdk_blob *blob, int bserrno)
 {
 	spdk_bs_sequence_t *seq = cb_arg;
+	struct spdk_blob_list *snapshot_entry = NULL;
 	uint32_t page_num;
 
-	if (bserrno != 0) {
+	if (bserrno) {
+		SPDK_ERRLOG("Failed to remove blob\n");
 		spdk_bs_sequence_finish(seq, bserrno);
 		return;
 	}
 
-	_spdk_blob_verify_md_op(blob);
-
-	if (blob->open_ref > 1) {
-		/*
-		 * Someone has this blob open (besides this delete context).
-		 *  Decrement the ref count directly and return -EBUSY.
-		 */
-		blob->open_ref--;
-		spdk_bs_sequence_finish(seq, -EBUSY);
-		return;
+	/* Remove snapshot from the list */
+	snapshot_entry = _spdk_bs_get_snapshot_entry(blob->bs, blob->id);
+	if (snapshot_entry != NULL) {
+		TAILQ_REMOVE(&blob->bs->snapshots, snapshot_entry, link);
+		free(snapshot_entry);
 	}
 
-	bserrno = _spdk_bs_blob_list_remove(blob);
-	if (bserrno != 0) {
-		SPDK_DEBUGLOG(SPDK_LOG_BLOB, "Remove blob #%" PRIu64 " from a list\n", blob->id);
-		spdk_bs_sequence_finish(seq, bserrno);
-		return;
-	}
-
-	/*
-	 * Remove the blob from the blob_store list now, to ensure it does not
-	 *  get returned after this point by _spdk_blob_lookup().
-	 */
-	TAILQ_REMOVE(&blob->bs->blobs, blob, link);
 	page_num = _spdk_bs_blobid_to_page(blob->id);
 	spdk_bit_array_clear(blob->bs->used_blobids, page_num);
 	blob->state = SPDK_BLOB_STATE_DIRTY;
@@ -4954,32 +5521,129 @@ _spdk_bs_delete_open_cpl(void *cb_arg, struct spdk_blob *blob, int bserrno)
 	_spdk_blob_persist(seq, blob, _spdk_bs_delete_persist_cpl, blob);
 }
 
+static int
+_spdk_bs_is_blob_deletable(struct spdk_blob *blob, bool *update_clone)
+{
+	struct spdk_blob_list *snapshot_entry = NULL;
+	struct spdk_blob_list *clone_entry = NULL;
+	struct spdk_blob *clone = NULL;
+	bool has_one_clone = false;
+
+	/* Check if this is a snapshot with clones */
+	snapshot_entry = _spdk_bs_get_snapshot_entry(blob->bs, blob->id);
+	if (snapshot_entry != NULL) {
+		if (snapshot_entry->clone_count > 1) {
+			SPDK_ERRLOG("Cannot remove snapshot with more than one clone\n");
+			return -EBUSY;
+		} else if (snapshot_entry->clone_count == 1) {
+			has_one_clone = true;
+		}
+	}
+
+	/* Check if someone has this blob open (besides this delete context):
+	 * - open_ref = 1 - only this context opened blob, so it is ok to remove it
+	 * - open_ref <= 2 && has_one_clone = true - clone is holding snapshot
+	 *	and that is ok, because we will update it accordingly */
+	if (blob->open_ref <= 2 && has_one_clone) {
+		clone_entry = TAILQ_FIRST(&snapshot_entry->clones);
+		assert(clone_entry != NULL);
+		clone = _spdk_blob_lookup(blob->bs, clone_entry->id);
+
+		if (blob->open_ref == 2 && clone == NULL) {
+			/* Clone is closed and someone else opened this blob */
+			SPDK_ERRLOG("Cannot remove snapshot because it is open\n");
+			return -EBUSY;
+		}
+
+		*update_clone = true;
+		return 0;
+	}
+
+	if (blob->open_ref > 1) {
+		SPDK_ERRLOG("Cannot remove snapshot because it is open\n");
+		return -EBUSY;
+	}
+
+	assert(has_one_clone == false);
+	*update_clone = false;
+	return 0;
+}
+
+static void
+_spdk_bs_delete_enomem_close_cpl(void *cb_arg, int bserrno)
+{
+	spdk_bs_sequence_t *seq = cb_arg;
+
+	spdk_bs_sequence_finish(seq, -ENOMEM);
+}
+
+static void
+_spdk_bs_delete_open_cpl(void *cb_arg, struct spdk_blob *blob, int bserrno)
+{
+	spdk_bs_sequence_t *seq = cb_arg;
+	struct delete_snapshot_ctx *ctx;
+	bool update_clone = false;
+
+	if (bserrno != 0) {
+		spdk_bs_sequence_finish(seq, bserrno);
+		return;
+	}
+
+	_spdk_blob_verify_md_op(blob);
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		spdk_blob_close(blob, _spdk_bs_delete_enomem_close_cpl, seq);
+		return;
+	}
+
+	ctx->snapshot = blob;
+	ctx->cb_fn = _spdk_bs_delete_blob_finish;
+	ctx->cb_arg = seq;
+
+	/* Check if blob can be removed and if it is a snapshot with clone on top of it */
+	ctx->bserrno = _spdk_bs_is_blob_deletable(blob, &update_clone);
+	if (ctx->bserrno) {
+		spdk_blob_close(blob, _spdk_delete_blob_cleanup_finish, ctx);
+		return;
+	}
+
+	if (blob->locked_operation_in_progress) {
+		SPDK_DEBUGLOG(SPDK_LOG_BLOB, "Cannot remove blob - another operation in progress\n");
+		ctx->bserrno = -EBUSY;
+		spdk_blob_close(blob, _spdk_delete_blob_cleanup_finish, ctx);
+		return;
+	}
+
+	blob->locked_operation_in_progress = true;
+
+	/*
+	 * Remove the blob from the blob_store list now, to ensure it does not
+	 *  get returned after this point by _spdk_blob_lookup().
+	 */
+	TAILQ_REMOVE(&blob->bs->blobs, blob, link);
+
+	if (update_clone) {
+		/* This blob is a snapshot with active clone - update clone first */
+		_spdk_update_clone_on_snapshot_deletion(blob, ctx);
+	} else {
+		/* This blob does not have any clones - just remove it */
+		_spdk_bs_blob_list_remove(blob);
+		_spdk_bs_delete_blob_finish(seq, blob, 0);
+		free(ctx);
+	}
+}
+
 void
 spdk_bs_delete_blob(struct spdk_blob_store *bs, spdk_blob_id blobid,
 		    spdk_blob_op_complete cb_fn, void *cb_arg)
 {
 	struct spdk_bs_cpl	cpl;
 	spdk_bs_sequence_t	*seq;
-	struct spdk_blob_list	*snapshot_entry = NULL;
 
 	SPDK_DEBUGLOG(SPDK_LOG_BLOB, "Deleting blob %lu\n", blobid);
 
 	assert(spdk_get_thread() == bs->md_thread);
-
-	/* Check if this is a snapshot with clones */
-	TAILQ_FOREACH(snapshot_entry, &bs->snapshots, link) {
-		if (snapshot_entry->id == blobid) {
-			break;
-		}
-	}
-	if (snapshot_entry != NULL) {
-		/* If snapshot have clones, we cannot remove it */
-		if (!TAILQ_EMPTY(&snapshot_entry->clones)) {
-			SPDK_ERRLOG("Cannot remove snapshot with clones\n");
-			cb_fn(cb_arg, -EBUSY);
-			return;
-		}
-	}
 
 	cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
 	cpl.u.blob_basic.cb_fn = cb_fn;
@@ -5017,11 +5681,12 @@ _spdk_bs_open_blob_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	spdk_bs_sequence_finish(seq, bserrno);
 }
 
-void spdk_bs_open_blob(struct spdk_blob_store *bs, spdk_blob_id blobid,
-		       spdk_blob_op_with_handle_complete cb_fn, void *cb_arg)
+static void _spdk_bs_open_blob(struct spdk_blob_store *bs, spdk_blob_id blobid,
+			       struct spdk_blob_open_opts *opts, spdk_blob_op_with_handle_complete cb_fn, void *cb_arg)
 {
 	struct spdk_blob		*blob;
 	struct spdk_bs_cpl		cpl;
+	struct spdk_blob_open_opts	opts_default;
 	spdk_bs_sequence_t		*seq;
 	uint32_t			page_num;
 
@@ -5048,6 +5713,13 @@ void spdk_bs_open_blob(struct spdk_blob_store *bs, spdk_blob_id blobid,
 		return;
 	}
 
+	if (!opts) {
+		spdk_blob_open_opts_init(&opts_default);
+		opts = &opts_default;
+	}
+
+	blob->clear_method = opts->clear_method;
+
 	cpl.type = SPDK_BS_CPL_TYPE_BLOB_HANDLE;
 	cpl.u.blob_handle.cb_fn = cb_fn;
 	cpl.u.blob_handle.cb_arg = cb_arg;
@@ -5062,6 +5734,19 @@ void spdk_bs_open_blob(struct spdk_blob_store *bs, spdk_blob_id blobid,
 
 	_spdk_blob_load(seq, blob, _spdk_bs_open_blob_cpl, blob);
 }
+
+void spdk_bs_open_blob(struct spdk_blob_store *bs, spdk_blob_id blobid,
+		       spdk_blob_op_with_handle_complete cb_fn, void *cb_arg)
+{
+	_spdk_bs_open_blob(bs, blobid, NULL, cb_fn, cb_arg);
+}
+
+void spdk_bs_open_blob_ext(struct spdk_blob_store *bs, spdk_blob_id blobid,
+			   struct spdk_blob_open_opts *opts, spdk_blob_op_with_handle_complete cb_fn, void *cb_arg)
+{
+	_spdk_bs_open_blob(bs, blobid, opts, cb_fn, cb_arg);
+}
+
 /* END spdk_bs_open_blob */
 
 /* START spdk_blob_set_read_only */
@@ -5394,11 +6079,19 @@ _spdk_blob_set_xattr(struct spdk_blob *blob, const char *name, const void *value
 {
 	struct spdk_xattr_tailq *xattrs;
 	struct spdk_xattr	*xattr;
+	size_t			desc_size;
 
 	_spdk_blob_verify_md_op(blob);
 
 	if (blob->md_ro) {
 		return -EPERM;
+	}
+
+	desc_size = sizeof(struct spdk_blob_md_descriptor_xattr) + strlen(name) + value_len;
+	if (desc_size > SPDK_BS_MAX_DESC_SIZE) {
+		SPDK_DEBUGLOG(SPDK_LOG_BLOB, "Xattr '%s' of size %ld does not fix into single page %ld\n", name,
+			      desc_size, SPDK_BS_MAX_DESC_SIZE);
+		return -ENOMEM;
 	}
 
 	if (internal) {
@@ -5594,12 +6287,7 @@ spdk_blob_is_snapshot(struct spdk_blob *blob)
 
 	assert(blob != NULL);
 
-	TAILQ_FOREACH(snapshot_entry, &blob->bs->snapshots, link) {
-		if (snapshot_entry->id == blob->id) {
-			break;
-		}
-	}
-
+	snapshot_entry = _spdk_bs_get_snapshot_entry(blob->bs, blob->id);
 	if (snapshot_entry == NULL) {
 		return false;
 	}
@@ -5651,11 +6339,7 @@ spdk_blob_get_clones(struct spdk_blob_store *bs, spdk_blob_id blobid, spdk_blob_
 	struct spdk_blob_list *snapshot_entry, *clone_entry;
 	size_t n;
 
-	TAILQ_FOREACH(snapshot_entry, &bs->snapshots, link) {
-		if (snapshot_entry->id == blobid) {
-			break;
-		}
-	}
+	snapshot_entry = _spdk_bs_get_snapshot_entry(bs, blobid);
 	if (snapshot_entry == NULL) {
 		*count = 0;
 		return 0;

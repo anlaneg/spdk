@@ -59,11 +59,11 @@ spdk_sigusr1(int signo __attribute__((__unused__)))
 static void
 iscsi_usage(void)
 {
-	printf(" -b         run iscsi target background, the default is foreground\n");
+	printf(" -b                        run iscsi target background, the default is foreground\n");
 }
 
 static void
-spdk_startup(void *arg1, void *arg2)
+spdk_startup(void *arg1)
 {
 	if (getenv("MEMZONE_DUMP") != NULL) {
 		spdk_memzone_dump(stdout);
@@ -71,7 +71,7 @@ spdk_startup(void *arg1, void *arg2)
 	}
 }
 
-static void
+static int
 iscsi_parse_arg(int ch, char *arg)
 {
 	switch (ch) {
@@ -79,9 +79,9 @@ iscsi_parse_arg(int ch, char *arg)
 		g_daemon_mode = 1;
 		break;
 	default:
-		assert(false);
-		break;
+		return -EINVAL;
 	}
+	return 0;
 }
 
 int
@@ -91,9 +91,8 @@ main(int argc, char **argv)
 	struct spdk_app_opts opts = {};
 
 	spdk_app_opts_init(&opts);
-	opts.config_file = SPDK_ISCSI_DEFAULT_CONFIG;
 	opts.name = "iscsi";
-	if ((rc = spdk_app_parse_args(argc, argv, &opts, "b",
+	if ((rc = spdk_app_parse_args(argc, argv, &opts, "b", NULL,
 				      iscsi_parse_arg, iscsi_usage)) !=
 	    SPDK_APP_PARSE_ARGS_SUCCESS) {
 		exit(rc);
@@ -101,7 +100,7 @@ main(int argc, char **argv)
 
 	if (g_daemon_mode) {
 		if (daemon(1, 0) < 0) {
-			SPDK_ERRLOG("Start iscsi target daemon faild.\n");
+			SPDK_ERRLOG("Start iscsi target daemon failed.\n");
 			exit(EXIT_FAILURE);
 		}
 	}
@@ -110,7 +109,7 @@ main(int argc, char **argv)
 	opts.usr1_handler = spdk_sigusr1;
 
 	/* Blocks until the application is exiting */
-	rc = spdk_app_start(&opts, spdk_startup, NULL, NULL);
+	rc = spdk_app_start(&opts, spdk_startup, NULL);
 	if (rc) {
 		SPDK_ERRLOG("Start iscsi target daemon:  spdk_app_start() retn non-zero\n");
 	}

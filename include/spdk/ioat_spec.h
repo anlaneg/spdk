@@ -47,6 +47,8 @@ extern "C" {
 
 #include "spdk/assert.h"
 
+#define SPDK_IOAT_PCI_CHANERR_INT_OFFSET	0x180
+
 #define SPDK_IOAT_INTRCTRL_MASTER_INT_EN	0x01
 
 #define SPDK_IOAT_VER_3_0                0x30
@@ -93,7 +95,7 @@ struct spdk_ioat_registers {
 	uint8_t		reserved2[0x8];	/* 0xA0 */
 	uint32_t	chanerr;	/* 0xA8 */
 	uint32_t	chanerrmask;	/* 0xAC */
-} __attribute__((packed));
+} __attribute__((packed)) __attribute__((aligned));
 
 #define SPDK_IOAT_CHANCMD_RESET			0x20
 #define SPDK_IOAT_CHANCMD_SUSPEND		0x04

@@ -57,6 +57,58 @@ store metadata in the form of key/value pairs with each blob which we'll refer t
 Blobstore owns the entire underlying device which is made up of a private Blobstore metadata region and the collection of
 blobs as managed by the application.
 
+@htmlonly
+
+  <div id="blob_hierarchy"></div>
+
+  <script>
+    let elem = document.getElementById('blob_hierarchy');
+
+    let canvasWidth = 800;
+    let canvasHeight = 200;
+    var two = new Two({ width: 800, height: 200 }).appendTo(elem);
+
+    var blobRect = two.makeRectangle(canvasWidth / 2, canvasHeight / 2, canvasWidth, canvasWidth);
+    blobRect.fill = '#7ED3F7';
+
+    var blobText = two.makeText('Blob', canvasWidth / 2, 10, { alignment: 'center'});
+
+    for (var i = 0; i < 2; i++) {
+        let clusterWidth = 400;
+        let clusterHeight = canvasHeight;
+        var clusterRect = two.makeRectangle((clusterWidth / 2) + (i * clusterWidth),
+                                            clusterHeight / 2,
+                                            clusterWidth - 10,
+                                            clusterHeight - 50);
+        clusterRect.fill = '#00AEEF';
+
+        var clusterText =  two.makeText('Cluster',
+                                        (clusterWidth / 2) + (i * clusterWidth),
+                                        35,
+                                        { alignment: 'center', fill: 'white' });
+
+
+        for (var j = 0; j < 4; j++) {
+            let pageWidth = 100;
+            let pageHeight = canvasHeight;
+            var pageRect = two.makeRectangle((pageWidth / 2) + (j * pageWidth) + (i * clusterWidth),
+                                             pageHeight / 2,
+                                             pageWidth - 20,
+                                             pageHeight - 100);
+            pageRect.fill = '#003C71';
+
+            var pageText =  two.makeText('Page',
+                                         (pageWidth / 2) + (j * pageWidth) + (i * clusterWidth),
+                                         pageHeight / 2,
+                                         { alignment: 'center', fill: 'white' });
+        }
+    }
+
+    two.update();
+  </script>
+
+@endhtmlonly
+
 ### Atomicity
 
 For all Blobstore operations regarding atomicity, there is a dependency on the underlying device to guarantee atomic
@@ -131,7 +183,7 @@ When the Blobstore is initialized, there are multiple configuration options to c
 options and their defaults are:
 
 * **Cluster Size**: By default, this value is 1MB. The cluster size is required to be a multiple of page size and should be
-selected based on the application’s usage model in terms of allocation. Recall that blobs are made of up clusters so when
+selected based on the application’s usage model in terms of allocation. Recall that blobs are made up of clusters so when
 a blob is allocated/deallocated or changes in size, disk LBAs will be manipulated in groups of cluster size.  If the
 application is expecting to deal with mainly very large (always multiple GB) blobs then it may make sense to change the
 cluster size to 1GB for example.
@@ -178,7 +230,7 @@ indicate and error. Synchronous calls will typically return an error value if ap
 ### Asynchronous API
 
 Asynchronous callbacks will return control not immediately, but at the point in execution where no
-more forward progress can be made without blocking.  Therefore, no assumptions can be made be made about the progress of
+more forward progress can be made without blocking.  Therefore, no assumptions can be made about the progress of
 an asynchronous call until the callback has completed.
 
 ### Xattrs
@@ -217,10 +269,7 @@ There are multiple examples of Blobstore usage in the [repo](https://github.com/
 * **Hello World**: Actually named `hello_blob.c` this is a very basic example of a single threaded application that
 does nothing more than demonstrate the very basic API. Although Blobstore is optimized for NVMe, this example uses
 a RAM disk (malloc) back-end so that it can be executed easily in any development environment. The malloc back-end
-is a `bdev` module thus this example uses not on the SPDK Framework but the `bdev` layer as well.
-
-* **Hello NVME Blob**: `hello_nvme_blob.c` is the non-bdev version of `hello_blob.c`and simply shows how an
-application can directly integrate Blobstore with the SPDK NVMe driver without using the `bdev` layer at all.
+is a `bdev` module thus this example uses not only the SPDK Framework but the `bdev` layer as well.
 
 * **CLI**: The `blobcli.c` example is command line utility intended to not only serve as example code but as a test
 and development tool for Blobstore itself. It is also a simple single threaded application that relies on both the
@@ -228,7 +277,7 @@ SPDK Framework and the `bdev` layer but offers multiple modes of operation to ac
 command mode, it accepts single-shot commands which can be a little time consuming if there are many commands to
 get through as each one will take a few seconds waiting for DPDK initialization. It therefore has a shell mode that
 allows the developer to get to a `blob>` prompt and then very quickly interact with Blobstore with simple commands
-that include the ability to import/export blobs from/to regular files. Lastly there is a a scripting mode to automate
+that include the ability to import/export blobs from/to regular files. Lastly there is a scripting mode to automate
 a series of tasks, again, handy for development and/or test type activities.
 
 ## Configuration {#blob_pg_config}
@@ -262,7 +311,7 @@ Cluster 0 is special and has the following format, where page 0 is the first pag
 
 The super block is a single page located at the beginning of the partition. It contains basic information about
 the Blobstore. The metadata region is the remainder of cluster 0 and may extend to additional clusters. Refer
-to the latest srouce code for complete structural details of the super block and metadata region.
+to the latest source code for complete structural details of the super block and metadata region.
 
 Each blob is allocated a non-contiguous set of pages inside the metadata region for its metadata. These pages
 form a linked list. The first page in the list will be written in place on update, while all other pages will
@@ -278,7 +327,7 @@ a serial fashion or in parallel, respectively. Both are defined using the follow
 struct spdk_bs_request_set;
 ~~~
 
-These requests sets are basically bookkeeping mechanisms to help Blobstore efficiently deal will related groups
+These requests sets are basically bookkeeping mechanisms to help Blobstore efficiently deal with related groups
 of IO. They are an internal construct only and are pre-allocated on a per channel basis (channels were discussed
 earlier). They are removed from a channel associated linked list when the set (sequence or batch) is started and
 then returned to the list when completed.
@@ -292,7 +341,7 @@ the public API is `blob.h`.
 ~~~{.sh}
 struct spdk_blob
 ~~~
-This is an in-memory data structure that contains key elements like the blob identifier, it's current state and two
+This is an in-memory data structure that contains key elements like the blob identifier, its current state and two
 copies of the mutable metadata for the blob; one copy is the current metadata and the other is the last copy written
 to disk.
 

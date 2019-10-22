@@ -35,6 +35,11 @@
 
 #include "spdk_internal/log.h"
 
+#ifdef SPDK_LOG_BACKTRACE_LVL
+#define UNW_LOCAL_ONLY
+#include <libunwind.h>
+#endif
+
 static const char *const spdk_level_names[] = {
 	[SPDK_LOG_ERROR]	= "ERROR",
 	[SPDK_LOG_WARN]		= "WARNING",
@@ -45,17 +50,63 @@ static const char *const spdk_level_names[] = {
 
 #define MAX_TMPBUF 1024
 
+static logfunc *g_log = NULL;
+
 void
-spdk_log_open(void)
+spdk_log_open(logfunc *logf)
 {
-	openlog("spdk", LOG_PID, LOG_LOCAL7);
+	if (logf) {
+		g_log = logf;
+	} else {
+		openlog("spdk", LOG_PID, LOG_LOCAL7);
+	}
 }
 
 void
 spdk_log_close(void)
 {
-	closelog();
+	if (!g_log) {
+		closelog();
+	}
 }
+
+#ifdef SPDK_LOG_BACKTRACE_LVL
+static void
+spdk_log_unwind_stack(FILE *fp, enum spdk_log_level level)
+{
+	unw_error_t err;
+	unw_cursor_t cursor;
+	unw_context_t uc;
+	unw_word_t ip;
+	unw_word_t offp;
+	char f_name[64];
+	int frame;
+
+	if (level > g_spdk_log_backtrace_level) {
+		return;
+	}
+
+	unw_getcontext(&uc);
+	unw_init_local(&cursor, &uc);
+	fprintf(fp, "*%s*: === BACKTRACE START ===\n", spdk_level_names[level]);
+
+	unw_step(&cursor);
+	for (frame = 1; unw_step(&cursor) > 0; frame++) {
+		unw_get_reg(&cursor, UNW_REG_IP, &ip);
+		err = unw_get_proc_name(&cursor, f_name, sizeof(f_name), &offp);
+		if (err || strcmp(f_name, "main") == 0) {
+			break;
+		}
+
+		fprintf(fp, "*%s*: %3d: %*s%s() at %#lx\n", spdk_level_names[level], frame, frame - 1, "", f_name,
+			(unsigned long)ip);
+	}
+	fprintf(fp, "*%s*: === BACKTRACE END ===\n", spdk_level_names[level]);
+}
+
+#else
+#define spdk_log_unwind_stack(fp, lvl)
+#endif
 
 void
 spdk_log(enum spdk_log_level level, const char *file, const int line, const char *func,
@@ -64,6 +115,17 @@ spdk_log(enum spdk_log_level level, const char *file, const int line, const char
 	int severity = LOG_INFO;
 	char buf[MAX_TMPBUF];
 	va_list ap;
+
+	if (g_log) {
+		va_start(ap, format);
+		g_log(level, file, line, func, format, ap);
+		va_end(ap);
+		return;
+	}
+
+	if (level > g_spdk_log_print_level && level > g_spdk_log_level) {
+		return;
+	}
 
 	switch (level) {
 	case SPDK_LOG_ERROR:
@@ -79,6 +141,8 @@ spdk_log(enum spdk_log_level level, const char *file, const int line, const char
 	case SPDK_LOG_DEBUG:
 		severity = LOG_INFO;
 		break;
+	case SPDK_LOG_DISABLED:
+		return;
 	}
 
 	va_start(ap, format);
@@ -87,6 +151,7 @@ spdk_log(enum spdk_log_level level, const char *file, const int line, const char
 
 	if (level <= g_spdk_log_print_level) {
 		fprintf(stderr, "%s:%4d:%s: *%s*: %s", file, line, func, spdk_level_names[level], buf);
+		spdk_log_unwind_stack(stderr, level);
 	}
 
 	if (level <= g_spdk_log_level) {
@@ -128,6 +193,11 @@ fdump(FILE *fp, const char *label, const uint8_t *buf, size_t len)
 		buf16[idx % 16] = isprint(buf[idx]) ? buf[idx] : '.';
 	}
 	for (; idx % 16 != 0; idx++) {
+		if (idx == 8) {
+			total += snprintf(tmpbuf + total, sizeof tmpbuf - total,
+					  " ");
+		}
+
 		total += snprintf(tmpbuf + total, sizeof tmpbuf - total, "   ");
 		buf16[idx % 16] = ' ';
 	}
@@ -137,7 +207,7 @@ fdump(FILE *fp, const char *label, const uint8_t *buf, size_t len)
 }
 
 void
-spdk_trace_dump(FILE *fp, const char *label, const void *buf, size_t len)
+spdk_log_dump(FILE *fp, const char *label, const void *buf, size_t len)
 {
 	fdump(fp, label, buf, len);
 }

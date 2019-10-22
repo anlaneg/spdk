@@ -1,7 +1,6 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright (C) 2008-2012 Daisuke Aoyama <aoyama@peach.ne.jp>.
  *   Copyright (c) Intel Corporation.
  *   All rights reserved.
  *
@@ -65,4 +64,10 @@ void
 spdk_uuid_generate(struct spdk_uuid *uuid)
 {
 	uuid_generate((void *)uuid);
+}
+
+void
+spdk_uuid_copy(struct spdk_uuid *dst, const struct spdk_uuid *src)
+{
+	uuid_copy((void *)dst, (void *)src);
 }

@@ -45,7 +45,6 @@ extern "C" {
 struct spdk_bdev;
 struct spdk_nbd_disk;
 struct spdk_json_write_ctx;
-struct spdk_event;
 
 /**
  * Initialize the network block device layer.
@@ -60,15 +59,22 @@ int spdk_nbd_init(void);
 void spdk_nbd_fini(void);
 
 /**
+ * Called when an NBD device has been started.
+ * On success, rc is assigned 0; On failure, rc is assigned negated errno.
+ */
+typedef void (*spdk_nbd_start_cb)(void *cb_arg, struct spdk_nbd_disk *nbd,
+				  int rc);
+
+/**
  * Start a network block device backed by the bdev.
  *
  * \param bdev_name Name of bdev exposed as a network block device.
  * \param nbd_path Path to the registered network block device.
- *
- * \return a pointer to the configuration of the registered network block device
- * on success, or NULL on failure.
+ * \param cb_fn Callback to be always called.
+ * \param cb_arg Passed to cb_fn.
  */
-struct spdk_nbd_disk *spdk_nbd_start(const char *bdev_name, const char *nbd_path);
+void spdk_nbd_start(const char *bdev_name, const char *nbd_path,
+		    spdk_nbd_start_cb cb_fn, void *cb_arg);
 
 /**
  * Stop the running network block device safely.
@@ -78,12 +84,16 @@ struct spdk_nbd_disk *spdk_nbd_start(const char *bdev_name, const char *nbd_path
 void spdk_nbd_stop(struct spdk_nbd_disk *nbd);
 
 /**
+ * Get the local filesystem path used for the network block device.
+ */
+const char *spdk_nbd_get_path(struct spdk_nbd_disk *nbd);
+
+/**
  * Write NBD subsystem configuration into provided JSON context.
  *
  * \param w JSON write context
- * \param done_ev call this event when done.
  */
-void spdk_nbd_write_config_json(struct spdk_json_write_ctx *w, struct spdk_event *done_ev);
+void spdk_nbd_write_config_json(struct spdk_json_write_ctx *w);
 
 #ifdef __cplusplus
 }

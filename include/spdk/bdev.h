@@ -1,9 +1,8 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright (C) 2008-2012 Daisuke Aoyama <aoyama@peach.ne.jp>.
- *   Copyright (c) Intel Corporation.
- *   All rights reserved.
+ *   Copyright (c) Intel Corporation. All rights reserved.
+ *   Copyright (c) 2019 Mellanox Technologies LTD. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
  *   modification, are permitted provided that the following conditions
@@ -45,6 +44,8 @@
 #include "spdk/nvme_spec.h"
 #include "spdk/json.h"
 #include "spdk/queue.h"
+#include "spdk/histogram_data.h"
+#include "spdk/dif.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -53,12 +54,41 @@ extern "C" {
 #define SPDK_BDEV_SMALL_BUF_MAX_SIZE 8192
 #define SPDK_BDEV_LARGE_BUF_MAX_SIZE (64 * 1024)
 
+/* Increase the buffer size to store interleaved metadata.  Increment is the
+ *  amount necessary to store metadata per data block.  16 byte metadata per
+ *  512 byte data block is the current maximum ratio of metadata per block.
+ */
+#define SPDK_BDEV_BUF_SIZE_WITH_MD(x)	(((x) / 512) * (512 + 16))
+
+/** Asynchronous event type */
+enum spdk_bdev_event_type {
+	SPDK_BDEV_EVENT_REMOVE,
+	SPDK_BDEV_EVENT_RESIZE
+};
+
+/**
+ * \brief SPDK block device.
+ *
+ * This is a virtual representation of a block device that is exported by the backend.
+ */
+struct spdk_bdev;
+
 /**
  * Block device remove callback.
  *
  * \param remove_ctx Context for the removed block device.
  */
 typedef void (*spdk_bdev_remove_cb_t)(void *remove_ctx);
+
+/**
+ * Block device event callback.
+ *
+ * \param event Event details.
+ * \param bdev Block device that triggered event.
+ * \param event_ctx Context for the block device event.
+ */
+typedef void (*spdk_bdev_event_cb_t)(enum spdk_bdev_event_type type, struct spdk_bdev *bdev,
+				     void *event_ctx);
 
 /**
  * Block device I/O
@@ -80,13 +110,6 @@ enum spdk_bdev_status {
 };
 
 /**
- * \brief SPDK block device.
- *
- * This is a virtual representation of a block device that is exported by the backend.
- */
-struct spdk_bdev;
-
-/**
  * \brief Handle to an opened SPDK block device.
  */
 struct spdk_bdev_desc;
@@ -103,7 +126,25 @@ enum spdk_bdev_io_type {
 	SPDK_BDEV_IO_TYPE_NVME_IO,
 	SPDK_BDEV_IO_TYPE_NVME_IO_MD,
 	SPDK_BDEV_IO_TYPE_WRITE_ZEROES,
+	SPDK_BDEV_IO_TYPE_ZCOPY,
+	SPDK_BDEV_IO_TYPE_GET_ZONE_INFO,
+	SPDK_BDEV_IO_TYPE_ZONE_MANAGEMENT,
+	SPDK_BDEV_IO_TYPE_ZONE_APPEND,
 	SPDK_BDEV_NUM_IO_TYPES /* Keep last */
+};
+
+/** bdev QoS rate limit type */
+enum spdk_bdev_qos_rate_limit_type {
+	/** IOPS rate limit for both read and write */
+	SPDK_BDEV_QOS_RW_IOPS_RATE_LIMIT = 0,
+	/** Byte per second rate limit for both read and write */
+	SPDK_BDEV_QOS_RW_BPS_RATE_LIMIT,
+	/** Byte per second rate limit for read only */
+	SPDK_BDEV_QOS_R_BPS_RATE_LIMIT,
+	/** Byte per second rate limit for write only */
+	SPDK_BDEV_QOS_W_BPS_RATE_LIMIT,
+	/** Keep last */
+	SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES
 };
 
 /**
@@ -124,8 +165,11 @@ struct spdk_bdev_io_stat {
 	uint64_t num_read_ops;
 	uint64_t bytes_written;
 	uint64_t num_write_ops;
+	uint64_t bytes_unmapped;
+	uint64_t num_unmap_ops;
 	uint64_t read_latency_ticks;
 	uint64_t write_latency_ticks;
+	uint64_t unmap_latency_ticks;
 	uint64_t ticks_rate;
 };
 
@@ -231,12 +275,16 @@ struct spdk_bdev *spdk_bdev_first_leaf(void);
 struct spdk_bdev *spdk_bdev_next_leaf(struct spdk_bdev *prev);
 
 /**
- * Open a block device for I/O operations.
+ * Open a block device for I/O operations (deprecated, please use spdk_bdev_open_ext).
  *
  * \param bdev Block device to open.
  * \param write true is read/write access requested, false if read-only
- * \param remove_cb callback function for hot remove the device.
- * \param remove_ctx param for hot removal callback function.
+ * \param remove_cb notification callback to be called when the bdev gets
+ * hotremoved. This will always be called on the same thread that
+ * spdk_bdev_open() was called on. It can be NULL, in which case the upper
+ * layer won't be notified about the bdev hotremoval. The descriptor will
+ * have to be manually closed to make the bdev unregister proceed.
+ * \param remove_ctx param for remove_cb.
  * \param desc output parameter for the descriptor when operation is successful
  * \return 0 if operation is successful, suitable errno value otherwise
  */
@@ -244,7 +292,27 @@ int spdk_bdev_open(struct spdk_bdev *bdev, bool write, spdk_bdev_remove_cb_t rem
 		   void *remove_ctx, struct spdk_bdev_desc **desc);
 
 /**
+ * Open a block device for I/O operations.
+ *
+ * \param bdev_name Block device name to open.
+ * \param write true is read/write access requested, false if read-only
+ * \param event_cb notification callback to be called when the bdev triggers
+ * asynchronous event such as bdev removal. This will always be called on the
+ * same thread that spdk_bdev_open() was called on. In case of removal event
+ * the descriptor will have to be manually closed to make the bdev unregister
+ * proceed.
+ * \param event_ctx param for event_cb.
+ * \param desc output parameter for the descriptor when operation is successful
+ * \return 0 if operation is successful, suitable errno value otherwise
+ */
+int spdk_bdev_open_ext(const char *bdev_name, bool write, spdk_bdev_event_cb_t event_cb,
+		       void *event_ctx, struct spdk_bdev_desc **desc);
+
+/**
  * Close a previously opened block device.
+ *
+ * Must be called on the same thread that the spdk_bdev_open()
+ * was performed on.
  *
  * \param desc Block device descriptor to close.
  */
@@ -281,21 +349,6 @@ bool spdk_bdev_io_type_supported(struct spdk_bdev *bdev, enum spdk_bdev_io_type 
 int spdk_bdev_dump_info_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w);
 
 /**
- * Output bdev-specific configuration to a JSON stream.
- *
- * If supported, the object with following keys will be written:
- * method - name of the constructor method
- * params - parameters necessary to recreate this \c bdev
- *
- * If \c bdev does not support writing JSON configuration then object will be written
- * with only one key - the name of this bdev.
- *
- * \param bdev block device to query configuration.
- * \param w pointer to a JSON write context where \c bdev the configuration will be written.
- */
-void spdk_bdev_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w);
-
-/**
  * Get block device name.
  *
  * \param bdev Block device to query.
@@ -320,6 +373,21 @@ const char *spdk_bdev_get_product_name(const struct spdk_bdev *bdev);
 uint32_t spdk_bdev_get_block_size(const struct spdk_bdev *bdev);
 
 /**
+ * Get the write unit size for this bdev.
+ *
+ * Write unit size is required number of logical blocks to perform write
+ * operation on block device.
+ *
+ * Unit of write unit size is logical block and the minimum of write unit
+ * size is one. Write operations must be multiple of write unit size.
+ *
+ * \param bdev Block device to query.
+ *
+ * \return The write unit size in logical blocks.
+ */
+uint32_t spdk_bdev_get_write_unit_size(const struct spdk_bdev *bdev);
+
+/**
  * Get size of block device in logical blocks.
  *
  * \param bdev Block device to query.
@@ -330,25 +398,35 @@ uint32_t spdk_bdev_get_block_size(const struct spdk_bdev *bdev);
 uint64_t spdk_bdev_get_num_blocks(const struct spdk_bdev *bdev);
 
 /**
- * Get IOs per second of block device for the QoS rate limiting.
+ * Get the string of quality of service rate limit.
  *
- * \param bdev Block device to query.
- * \return IOs per second.
- *
- * Return 0 for no QoS enforced on the queried block device.
+ * \param type Type of rate limit to query.
+ * \return String of QoS type.
  */
-uint64_t spdk_bdev_get_qos_ios_per_sec(struct spdk_bdev *bdev);
+const char *spdk_bdev_get_qos_rpc_type(enum spdk_bdev_qos_rate_limit_type type);
 
 /**
- * Set an IOPS-based quality of service rate limit on a bdev.
+ * Get the quality of service rate limits on a bdev.
+ *
+ * \param bdev Block device to query.
+ * \param limits Pointer to the QoS rate limits array which holding the limits.
+ *
+ * The limits are ordered based on the @ref spdk_bdev_qos_rate_limit_type enum.
+ */
+void spdk_bdev_get_qos_rate_limits(struct spdk_bdev *bdev, uint64_t *limits);
+
+/**
+ * Set the quality of service rate limits on a bdev.
  *
  * \param bdev Block device.
- * \param ios_per_sec I/O per second limit.
+ * \param limits Pointer to the QoS rate limits array which holding the limits.
  * \param cb_fn Callback function to be called when the QoS limit has been updated.
  * \param cb_arg Argument to pass to cb_fn.
+ *
+ * The limits are ordered based on the @ref spdk_bdev_qos_rate_limit_type enum.
  */
-void spdk_bdev_set_qos_limit_iops(struct spdk_bdev *bdev, uint64_t ios_per_sec,
-				  void (*cb_fn)(void *cb_arg, int status), void *cb_arg);
+void spdk_bdev_set_qos_rate_limits(struct spdk_bdev *bdev, uint64_t *limits,
+				   void (*cb_fn)(void *cb_arg, int status), void *cb_arg);
 
 /**
  * Get minimum I/O buffer address alignment for a bdev.
@@ -384,10 +462,168 @@ bool spdk_bdev_has_write_cache(const struct spdk_bdev *bdev);
  * \param bdev Block device to query.
  * \return Pointer to UUID.
  *
- * Not all bdevs will have a UUID; in this case, the returned UUID will be
- * the nil UUID (all bytes zero).
+ * All bdevs will have a UUID, but not all UUIDs will be persistent across
+ * application runs.
  */
 const struct spdk_uuid *spdk_bdev_get_uuid(const struct spdk_bdev *bdev);
+
+/**
+ * Get block device metadata size.
+ *
+ * \param bdev Block device to query.
+ * \return Size of metadata for this bdev in bytes.
+ */
+uint32_t spdk_bdev_get_md_size(const struct spdk_bdev *bdev);
+
+/**
+ * Query whether metadata is interleaved with block data or separated
+ * with block data.
+ *
+ * \param bdev Block device to query.
+ * \return true if metadata is interleaved with block data or false
+ * if metadata is separated with block data.
+ *
+ * Note this function is valid only if there is metadata.
+ */
+bool spdk_bdev_is_md_interleaved(const struct spdk_bdev *bdev);
+
+/**
+ * Query whether metadata is interleaved with block data or separated
+ * from block data.
+ *
+ * \param bdev Block device to query.
+ * \return true if metadata is separated from block data, false
+ * otherwise.
+ *
+ * Note this function is valid only if there is metadata.
+ */
+bool spdk_bdev_is_md_separate(const struct spdk_bdev *bdev);
+
+/**
+ * Checks if bdev supports zoned namespace semantics.
+ *
+ * \param bdev Block device to query.
+ * \return true if device supports zoned namespace sementics.
+ */
+bool spdk_bdev_is_zoned(const struct spdk_bdev *bdev);
+
+/**
+ * Get block device data block size.
+ *
+ * Data block size is equal to block size if there is no metadata or
+ * metadata is separated with block data, or equal to block size minus
+ * metadata size if there is metadata and it is interleaved with
+ * block data.
+ *
+ * \param bdev Block device to query.
+ * \return Size of data block for this bdev in bytes.
+ */
+uint32_t spdk_bdev_get_data_block_size(const struct spdk_bdev *bdev);
+
+/**
+ * Get DIF type of the block device.
+ *
+ * \param bdev Block device to query.
+ * \return DIF type of the block device.
+ */
+enum spdk_dif_type spdk_bdev_get_dif_type(const struct spdk_bdev *bdev);
+
+/**
+ * Check whether DIF is set in the first 8 bytes or the last 8 bytes of metadata.
+ *
+ * \param bdev Block device to query.
+ * \return true if DIF is set in the first 8 bytes of metadata, or false
+ * if DIF is set in the last 8 bytes of metadata.
+ *
+ * Note that this function is valid only if DIF type is not SPDK_DIF_DISABLE.
+ */
+bool spdk_bdev_is_dif_head_of_md(const struct spdk_bdev *bdev);
+
+/**
+ * Check whether the DIF check type is enabled.
+ *
+ * \param bdev Block device to query.
+ * \param check_type The specific DIF check type.
+ * \return true if enabled, false otherwise.
+ */
+bool spdk_bdev_is_dif_check_enabled(const struct spdk_bdev *bdev,
+				    enum spdk_dif_check_type check_type);
+
+/**
+ * Get the most recently measured queue depth from a bdev.
+ *
+ * The reported queue depth is the aggregate of outstanding I/O
+ * across all open channels associated with this bdev.
+ *
+ * \param bdev Block device to query.
+ *
+ * \return The most recent queue depth measurement for the bdev.
+ * If tracking is not enabled, the function will return UINT64_MAX
+ * It is also possible to receive UINT64_MAX after enabling tracking
+ * but before the first period has expired.
+ */
+uint64_t
+spdk_bdev_get_qd(const struct spdk_bdev *bdev);
+
+/**
+ * Get the queue depth polling period.
+ *
+ * The return value of this function is only valid if the bdev's
+ * queue depth tracking status is set to true.
+ *
+ * \param bdev Block device to query.
+ *
+ * \return The period at which this bdev's gueue depth is being refreshed.
+ */
+uint64_t
+spdk_bdev_get_qd_sampling_period(const struct spdk_bdev *bdev);
+
+/**
+ * Enable or disable queue depth sampling for this bdev.
+ *
+ * Enables queue depth sampling when period is greater than 0. Disables it when the period
+ * is equal to zero. The resulting queue depth is stored in the spdk_bdev object as
+ * measured_queue_depth.
+ *
+ * \param bdev Block device on which to enable queue depth tracking.
+ * \param period The period at which to poll this bdev's queue depth. If this is set
+ * to zero, polling will be disabled.
+ */
+void spdk_bdev_set_qd_sampling_period(struct spdk_bdev *bdev, uint64_t period);
+
+/**
+ * Get the time spent processing IO for this device.
+ *
+ * This value is dependent upon the queue depth sampling period and is
+ * incremented at sampling time by the sampling period only if the measured
+ * queue depth is greater than 0.
+ *
+ * The disk utilization can be calculated by the following formula:
+ * disk_util = (io_time_2 - io_time_1) / elapsed_time.
+ * The user is responsible for tracking the elapsed time between two measurements.
+ *
+ * \param bdev Block device to query.
+ *
+ * \return The io time for this device in microseconds.
+ */
+uint64_t spdk_bdev_get_io_time(const struct spdk_bdev *bdev);
+
+/**
+ * Get the weighted IO processing time for this bdev.
+ *
+ * This value is dependent upon the queue depth sampling period and is
+ * equal to the time spent reading from or writing to a device times
+ * the measured queue depth during each sampling period.
+ *
+ * The average queue depth can be calculated by the following formula:
+ * queue_depth = (weighted_io_time_2 - weighted_io_time_1) / elapsed_time.
+ * The user is responsible for tracking the elapsed time between two measurements.
+ *
+ * \param bdev Block device to query.
+ *
+ * \return The weighted io time for this device in microseconds.
+ */
+uint64_t spdk_bdev_get_weighted_io_time(const struct spdk_bdev *bdev);
 
 /**
  * Obtain an I/O channel for the block device opened by the specified
@@ -456,6 +692,33 @@ int spdk_bdev_read_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *c
 			  spdk_bdev_io_completion_cb cb, void *cb_arg);
 
 /**
+ * Submit a read request to the bdev on the given channel. This function uses
+ * separate buffer for metadata transfer (valid only if bdev supports this
+ * mode).
+ *
+ * \ingroup bdev_io_submit_functions
+ *
+ * \param desc Block device descriptor.
+ * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
+ * \param buf Data buffer to read into.
+ * \param md Metadata buffer.
+ * \param offset_blocks The offset, in blocks, from the start of the block device.
+ * \param num_blocks The number of blocks to read.
+ * \param cb Called when the request is complete.
+ * \param cb_arg Argument passed to cb.
+ *
+ * \return 0 on success. On success, the callback will always
+ * be called (even if the request ultimately failed). Return
+ * negated errno on failure, in which case the callback will not be called.
+ *   * -EINVAL - offset_blocks and/or num_blocks are out of range or separate
+ *               metadata is not supported
+ *   * -ENOMEM - spdk_bdev_io buffer cannot be allocated
+ */
+int spdk_bdev_read_blocks_with_md(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+				  void *buf, void *md, int64_t offset_blocks, uint64_t num_blocks,
+				  spdk_bdev_io_completion_cb cb, void *cb_arg);
+
+/**
  * Submit a read request to the bdev on the given channel. This differs from
  * spdk_bdev_read by allowing the data buffer to be described in a scatter
  * gather list. Some physical devices place memory alignment requirements on
@@ -514,6 +777,38 @@ int spdk_bdev_readv_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *
 			   spdk_bdev_io_completion_cb cb, void *cb_arg);
 
 /**
+ * Submit a read request to the bdev on the given channel. This differs from
+ * spdk_bdev_read by allowing the data buffer to be described in a scatter
+ * gather list. Some physical devices place memory alignment requirements on
+ * data or metadata and may not be able to directly transfer into the buffers
+ * provided. In this case, the request may fail. This function uses separate
+ * buffer for metadata transfer (valid only if bdev supports this mode).
+ *
+ * \ingroup bdev_io_submit_functions
+ *
+ * \param desc Block device descriptor.
+ * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
+ * \param iov A scatter gather list of buffers to be read into.
+ * \param iovcnt The number of elements in iov.
+ * \param md Metadata buffer.
+ * \param offset_blocks The offset, in blocks, from the start of the block device.
+ * \param num_blocks The number of blocks to read.
+ * \param cb Called when the request is complete.
+ * \param cb_arg Argument passed to cb.
+ *
+ * \return 0 on success. On success, the callback will always
+ * be called (even if the request ultimately failed). Return
+ * negated errno on failure, in which case the callback will not be called.
+ *   * -EINVAL - offset_blocks and/or num_blocks are out of range or separate
+ *               metadata is not supported
+ *   * -ENOMEM - spdk_bdev_io buffer cannot be allocated
+ */
+int spdk_bdev_readv_blocks_with_md(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+				   struct iovec *iov, int iovcnt, void *md,
+				   uint64_t offset_blocks, uint64_t num_blocks,
+				   spdk_bdev_io_completion_cb cb, void *cb_arg);
+
+/**
  * Submit a write request to the bdev on the given channel.
  *
  * \ingroup bdev_io_submit_functions
@@ -560,6 +855,34 @@ int spdk_bdev_write(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 int spdk_bdev_write_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 			   void *buf, uint64_t offset_blocks, uint64_t num_blocks,
 			   spdk_bdev_io_completion_cb cb, void *cb_arg);
+
+/**
+ * Submit a write request to the bdev on the given channel. This function uses
+ * separate buffer for metadata transfer (valid only if bdev supports this
+ * mode).
+ *
+ * \ingroup bdev_io_submit_functions
+ *
+ * \param desc Block device descriptor.
+ * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
+ * \param buf Data buffer to written from.
+ * \param md Metadata buffer.
+ * \param offset_blocks The offset, in blocks, from the start of the block device.
+ * \param num_blocks The number of blocks to write. buf must be greater than or equal to this size.
+ * \param cb Called when the request is complete.
+ * \param cb_arg Argument passed to cb.
+ *
+ * \return 0 on success. On success, the callback will always
+ * be called (even if the request ultimately failed). Return
+ * negated errno on failure, in which case the callback will not be called.
+ *   * -EINVAL - offset_blocks and/or num_blocks are out of range or separate
+ *               metadata is not supported
+ *   * -ENOMEM - spdk_bdev_io buffer cannot be allocated
+ *   * -EBADF - desc not open for writing
+ */
+int spdk_bdev_write_blocks_with_md(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+				   void *buf, void *md, uint64_t offset_blocks, uint64_t num_blocks,
+				   spdk_bdev_io_completion_cb cb, void *cb_arg);
 
 /**
  * Submit a write request to the bdev on the given channel. This differs from
@@ -620,6 +943,80 @@ int spdk_bdev_writev_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel 
 			    struct iovec *iov, int iovcnt,
 			    uint64_t offset_blocks, uint64_t num_blocks,
 			    spdk_bdev_io_completion_cb cb, void *cb_arg);
+
+/**
+ * Submit a write request to the bdev on the given channel. This differs from
+ * spdk_bdev_write by allowing the data buffer to be described in a scatter
+ * gather list. Some physical devices place memory alignment requirements on
+ * data or metadata and may not be able to directly transfer out of the buffers
+ * provided. In this case, the request may fail.  This function uses separate
+ * buffer for metadata transfer (valid only if bdev supports this mode).
+ *
+ * \ingroup bdev_io_submit_functions
+ *
+ * \param desc Block device descriptor.
+ * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
+ * \param iov A scatter gather list of buffers to be written from.
+ * \param iovcnt The number of elements in iov.
+ * \param md Metadata buffer.
+ * \param offset_blocks The offset, in blocks, from the start of the block device.
+ * \param num_blocks The number of blocks to write.
+ * \param cb Called when the request is complete.
+ * \param cb_arg Argument passed to cb.
+ *
+ * \return 0 on success. On success, the callback will always
+ * be called (even if the request ultimately failed). Return
+ * negated errno on failure, in which case the callback will not be called.
+ *   * -EINVAL - offset_blocks and/or num_blocks are out of range or separate
+ *               metadata is not supported
+ *   * -ENOMEM - spdk_bdev_io buffer cannot be allocated
+ *   * -EBADF - desc not open for writing
+ */
+int spdk_bdev_writev_blocks_with_md(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+				    struct iovec *iov, int iovcnt, void *md,
+				    uint64_t offset_blocks, uint64_t num_blocks,
+				    spdk_bdev_io_completion_cb cb, void *cb_arg);
+
+/**
+ * Submit a request to acquire a data buffer that represents the given
+ * range of blocks. The data buffer is placed in the spdk_bdev_io structure
+ * and can be obtained by calling spdk_bdev_io_get_iovec().
+ *
+ * \param desc Block device descriptor
+ * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
+ * \param offset_blocks The offset, in blocks, from the start of the block device.
+ * \param num_blocks The number of blocks.
+ * \param populate Whether the data buffer should be populated with the
+ *                 data at the given blocks. Populating the data buffer can
+ *                 be skipped if the user writes new data to the entire buffer.
+ * \param cb Called when the request is complete.
+ * \param cb_arg Argument passed to cb.
+ *
+ * \return 0 on success. On success, the callback will always
+ * be called (even if the request ultimately failed). Return
+ * negated errno on failure, in which case the callback will not be called.
+ */
+int spdk_bdev_zcopy_start(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+			  uint64_t offset_blocks, uint64_t num_blocks,
+			  bool populate,
+			  spdk_bdev_io_completion_cb cb, void *cb_arg);
+
+
+/**
+ * Submit a request to release a data buffer representing a range of blocks.
+ *
+ * \param bdev_io I/O request returned in the completion callback of spdk_bdev_zcopy_start().
+ * \param commit Whether to commit the data in the buffers to the blocks before releasing.
+ *               The data does not need to be committed if it was not modified.
+ * \param cb Called when the request is complete.
+ * \param cb_arg Argument passed to cb.
+ *
+ * \return 0 on success. On success, the callback will always
+ * be called (even if the request ultimately failed). Return
+ * negated errno on failure, in which case the callback will not be called.
+ */
+int spdk_bdev_zcopy_end(struct spdk_bdev_io *bdev_io, bool commit,
+			spdk_bdev_io_completion_cb cb, void *cb_arg);
 
 /**
  * Submit a write zeroes request to the bdev on the given channel. This command
@@ -948,6 +1345,7 @@ int spdk_bdev_queue_io_wait(struct spdk_bdev *bdev, struct spdk_io_channel *ch,
 void spdk_bdev_get_io_stat(struct spdk_bdev *bdev, struct spdk_io_channel *ch,
 			   struct spdk_bdev_io_stat *stat);
 
+
 /**
  * Return I/O statistics for this bdev. All the required information will be passed
  * via the callback function.
@@ -989,6 +1387,44 @@ void spdk_bdev_io_get_scsi_status(const struct spdk_bdev_io *bdev_io,
  * \param iovcntp Pointer to be filled with number of iovec entries.
  */
 void spdk_bdev_io_get_iovec(struct spdk_bdev_io *bdev_io, struct iovec **iovp, int *iovcntp);
+
+/**
+ * Get metadata buffer. Only makes sense if the IO uses separate buffer for
+ * metadata transfer.
+ *
+ * \param bdev_io I/O to retrieve the buffer from.
+ * \return Pointer to metadata buffer, NULL if the IO doesn't use separate
+ * buffer for metadata transfer.
+ */
+void *spdk_bdev_io_get_md_buf(struct spdk_bdev_io *bdev_io);
+
+typedef void (*spdk_bdev_histogram_status_cb)(void *cb_arg, int status);
+typedef void (*spdk_bdev_histogram_data_cb)(void *cb_arg, int status,
+		struct spdk_histogram_data *histogram);
+
+/**
+ * Enable or disable collecting histogram data on a bdev.
+ *
+ * \param bdev Block device.
+ * \param cb_fn Callback function to be called when histograms are enabled.
+ * \param cb_arg Argument to pass to cb_fn.
+ * \param enable Enable/disable flag
+ */
+void spdk_bdev_histogram_enable(struct spdk_bdev *bdev, spdk_bdev_histogram_status_cb cb_fn,
+				void *cb_arg, bool enable);
+
+/**
+ * Get aggregated histogram data from a bdev. Callback provides merged histogram
+ * for specified bdev.
+ *
+ * \param bdev Block device.
+ * \param histogram Histogram for aggregated data
+ * \param cb_fn Callback function to be called with data collected on bdev.
+ * \param cb_arg Argument to pass to cb_fn.
+ */
+void spdk_bdev_histogram_get(struct spdk_bdev *bdev, struct spdk_histogram_data *histogram,
+			     spdk_bdev_histogram_data_cb cb_fn,
+			     void *cb_arg);
 
 #ifdef __cplusplus
 }

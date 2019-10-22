@@ -41,6 +41,8 @@
 #include "scsi/dev.c"
 #include "scsi/port.c"
 
+#include "spdk_internal/mock.h"
+
 /* Unit test bdev mockup */
 struct spdk_bdev {
 	char name[100];
@@ -50,6 +52,9 @@ static struct spdk_bdev g_bdevs[] = {
 	{"malloc0"},
 	{"malloc1"},
 };
+
+static struct spdk_scsi_port *g_initiator_port_with_pending_tasks = NULL;
+static struct spdk_scsi_port *g_initiator_port_with_pending_mgmt_tasks = NULL;
 
 const char *
 spdk_bdev_get_name(const struct spdk_bdev *bdev)
@@ -111,39 +116,40 @@ spdk_bdev_get_by_name(const char *bdev_name)
 	return NULL;
 }
 
-int
-spdk_scsi_lun_task_mgmt_execute(struct spdk_scsi_task *task, enum spdk_scsi_task_func func)
-{
-	return 0;
-}
+DEFINE_STUB_V(spdk_scsi_lun_append_mgmt_task,
+	      (struct spdk_scsi_lun *lun, struct spdk_scsi_task *task));
 
-void
-spdk_scsi_lun_execute_task(struct spdk_scsi_lun *lun, struct spdk_scsi_task *task)
-{
-}
+DEFINE_STUB_V(spdk_scsi_lun_execute_mgmt_task, (struct spdk_scsi_lun *lun));
 
-int
-spdk_scsi_lun_allocate_io_channel(struct spdk_scsi_lun *lun)
-{
-	return 0;
-}
+DEFINE_STUB_V(spdk_scsi_lun_append_task,
+	      (struct spdk_scsi_lun *lun, struct spdk_scsi_task *task));
 
-void
-spdk_scsi_lun_free_io_channel(struct spdk_scsi_lun *lun)
+DEFINE_STUB_V(spdk_scsi_lun_execute_tasks, (struct spdk_scsi_lun *lun));
+
+DEFINE_STUB(_spdk_scsi_lun_allocate_io_channel, int,
+	    (struct spdk_scsi_lun *lun), 0);
+
+DEFINE_STUB_V(_spdk_scsi_lun_free_io_channel, (struct spdk_scsi_lun *lun));
+
+bool
+spdk_scsi_lun_has_pending_mgmt_tasks(const struct spdk_scsi_lun *lun,
+				     const struct spdk_scsi_port *initiator_port)
 {
+	return (g_initiator_port_with_pending_mgmt_tasks == initiator_port);
 }
 
 bool
-spdk_scsi_lun_has_pending_tasks(const struct spdk_scsi_lun *lun)
+spdk_scsi_lun_has_pending_tasks(const struct spdk_scsi_lun *lun,
+				const struct spdk_scsi_port *initiator_port)
 {
-	return false;
+	return (g_initiator_port_with_pending_tasks == initiator_port);
 }
 
 static void
 dev_destruct_null_dev(void)
 {
 	/* pass null for the dev */
-	spdk_scsi_dev_destruct(NULL);
+	spdk_scsi_dev_destruct(NULL, NULL, NULL);
 }
 
 static void
@@ -154,7 +160,7 @@ dev_destruct_zero_luns(void)
 	/* No luns attached to the dev */
 
 	/* free the dev */
-	spdk_scsi_dev_destruct(&dev);
+	spdk_scsi_dev_destruct(&dev, NULL, NULL);
 }
 
 static void
@@ -166,7 +172,7 @@ dev_destruct_null_lun(void)
 	dev.lun[0] = NULL;
 
 	/* free the dev */
-	spdk_scsi_dev_destruct(&dev);
+	spdk_scsi_dev_destruct(&dev, NULL, NULL);
 }
 
 static void
@@ -181,7 +187,7 @@ dev_destruct_success(void)
 	CU_ASSERT(rc == 0);
 
 	/* free the dev */
-	spdk_scsi_dev_destruct(&dev);
+	spdk_scsi_dev_destruct(&dev, NULL, NULL);
 
 }
 
@@ -261,7 +267,7 @@ dev_construct_success(void)
 	CU_ASSERT_TRUE(dev != NULL);
 
 	/* free the dev */
-	spdk_scsi_dev_destruct(dev);
+	spdk_scsi_dev_destruct(dev, NULL, NULL);
 }
 
 static void
@@ -278,7 +284,7 @@ dev_construct_success_lun_zero_not_first(void)
 	CU_ASSERT_TRUE(dev != NULL);
 
 	/* free the dev */
-	spdk_scsi_dev_destruct(dev);
+	spdk_scsi_dev_destruct(dev, NULL, NULL);
 }
 
 static void
@@ -297,11 +303,12 @@ dev_queue_mgmt_task_success(void)
 
 	task = spdk_get_task(NULL);
 
-	spdk_scsi_dev_queue_mgmt_task(dev, task, SPDK_SCSI_TASK_FUNC_LUN_RESET);
+	task->function = SPDK_SCSI_TASK_FUNC_LUN_RESET;
+	spdk_scsi_dev_queue_mgmt_task(dev, task);
 
 	spdk_scsi_task_put(task);
 
-	spdk_scsi_dev_destruct(dev);
+	spdk_scsi_dev_destruct(dev, NULL, NULL);
 }
 
 static void
@@ -324,7 +331,7 @@ dev_queue_task_success(void)
 
 	spdk_scsi_task_put(task);
 
-	spdk_scsi_dev_destruct(dev);
+	spdk_scsi_dev_destruct(dev, NULL, NULL);
 }
 
 static void
@@ -341,7 +348,8 @@ dev_stop_success(void)
 	task_mgmt = spdk_get_task(NULL);
 
 	/* Enqueue the tasks into dev->task_mgmt_submit_queue */
-	spdk_scsi_dev_queue_mgmt_task(&dev, task_mgmt, SPDK_SCSI_TASK_FUNC_LUN_RESET);
+	task->function = SPDK_SCSI_TASK_FUNC_LUN_RESET;
+	spdk_scsi_dev_queue_mgmt_task(&dev, task_mgmt);
 
 	spdk_scsi_task_put(task);
 	spdk_scsi_task_put(task_mgmt);
@@ -555,8 +563,9 @@ dev_add_lun_bdev_not_found(void)
 	int rc;
 	struct spdk_scsi_dev dev = {0};
 
-	rc = spdk_scsi_dev_add_lun(&dev, "malloc2", -1, NULL, NULL);
+	rc = spdk_scsi_dev_add_lun(&dev, "malloc2", 0, NULL, NULL);
 
+	SPDK_CU_ASSERT_FATAL(dev.lun[0] == NULL);
 	CU_ASSERT_NOT_EQUAL(rc, 0);
 }
 
@@ -587,7 +596,7 @@ dev_add_lun_success1(void)
 
 	CU_ASSERT_EQUAL(rc, 0);
 
-	spdk_scsi_dev_destruct(&dev);
+	spdk_scsi_dev_destruct(&dev, NULL, NULL);
 }
 
 static void
@@ -600,7 +609,34 @@ dev_add_lun_success2(void)
 
 	CU_ASSERT_EQUAL(rc, 0);
 
-	spdk_scsi_dev_destruct(&dev);
+	spdk_scsi_dev_destruct(&dev, NULL, NULL);
+}
+
+static void
+dev_check_pending_tasks(void)
+{
+	struct spdk_scsi_dev dev = {};
+	struct spdk_scsi_lun lun = {};
+	struct spdk_scsi_port initiator_port = {};
+
+	g_initiator_port_with_pending_tasks = NULL;
+	g_initiator_port_with_pending_mgmt_tasks = NULL;
+
+	CU_ASSERT(spdk_scsi_dev_has_pending_tasks(&dev, NULL) == false);
+
+	dev.lun[SPDK_SCSI_DEV_MAX_LUN - 1] = &lun;
+
+	CU_ASSERT(spdk_scsi_dev_has_pending_tasks(&dev, NULL) == true);
+	CU_ASSERT(spdk_scsi_dev_has_pending_tasks(&dev, &initiator_port) == false);
+
+	g_initiator_port_with_pending_tasks = &initiator_port;
+	CU_ASSERT(spdk_scsi_dev_has_pending_tasks(&dev, NULL) == true);
+	CU_ASSERT(spdk_scsi_dev_has_pending_tasks(&dev, &initiator_port) == true);
+
+	g_initiator_port_with_pending_tasks = NULL;
+	g_initiator_port_with_pending_mgmt_tasks = &initiator_port;
+	CU_ASSERT(spdk_scsi_dev_has_pending_tasks(&dev, NULL) == true);
+	CU_ASSERT(spdk_scsi_dev_has_pending_tasks(&dev, &initiator_port) == true);
 }
 
 int
@@ -666,6 +702,8 @@ main(int argc, char **argv)
 			       dev_add_lun_success1) == NULL
 		|| CU_add_test(suite, "dev add lun - success 2",
 			       dev_add_lun_success2) == NULL
+		|| CU_add_test(suite, "dev check pending tasks",
+			       dev_check_pending_tasks) == NULL
 	) {
 		CU_cleanup_registry();
 		return CU_get_error();

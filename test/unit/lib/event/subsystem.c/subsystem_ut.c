@@ -37,46 +37,16 @@
 
 #include "unit/lib/json_mock.c"
 #include "event/subsystem.c"
+#include "common/lib/test_env.c"
 
 static struct spdk_subsystem g_ut_subsystems[8];
 static struct spdk_subsystem_depend g_ut_subsystem_deps[8];
 static int global_rc;
 
-void
-spdk_app_stop(int rc)
+static void
+ut_event_fn(int rc, void *arg1)
 {
 	global_rc = rc;
-}
-
-uint32_t
-spdk_env_get_current_core(void)
-{
-	return 0;
-}
-
-static void
-ut_event_fn(void *arg1, void *arg2)
-{
-}
-
-struct spdk_event *
-spdk_event_allocate(uint32_t core, spdk_event_fn fn, void *arg1, void *arg2)
-{
-	struct spdk_event *event = calloc(1, sizeof(*event));
-
-	SPDK_CU_ASSERT_FATAL(event != NULL);
-
-	event->fn = fn;
-	event->arg1 = arg1;
-	event->arg2 = arg2;
-
-	return event;
-}
-
-void spdk_event_call(struct spdk_event *event)
-{
-	event->fn(event->arg1, event->arg2);
-	free(event);
 }
 
 static void
@@ -117,11 +87,10 @@ subsystem_sort_test_depends_on_single(void)
 	struct spdk_subsystem *subsystem;
 	int i;
 	char subsystem_name[16];
-	struct spdk_event *app_start_event;
 
 	global_rc = -1;
-	app_start_event = spdk_event_allocate(0, ut_event_fn, NULL, NULL);
-	spdk_subsystem_init(app_start_event);
+	spdk_subsystem_init(ut_event_fn, NULL);
+	CU_ASSERT(global_rc == 0);
 
 	i = 4;
 	TAILQ_FOREACH(subsystem, &g_subsystems, tailq) {
@@ -137,7 +106,6 @@ subsystem_sort_test_depends_on_multiple(void)
 {
 	int i;
 	struct spdk_subsystem *subsystem;
-	struct spdk_event *app_start_event;
 
 	subsystem_clear();
 	set_up_subsystem(&g_ut_subsystems[0], "iscsi");
@@ -167,8 +135,8 @@ subsystem_sort_test_depends_on_multiple(void)
 	}
 
 	global_rc = -1;
-	app_start_event = spdk_event_allocate(0, ut_event_fn, NULL, NULL);
-	spdk_subsystem_init(app_start_event);
+	spdk_subsystem_init(ut_event_fn, NULL);
+	CU_ASSERT(global_rc == 0);
 
 	subsystem = TAILQ_FIRST(&g_subsystems);
 	CU_ASSERT(strcmp(subsystem->name, "interface") == 0);
@@ -243,7 +211,7 @@ subsystem_sort_test_missing_dependency(void)
 	spdk_add_subsystem_depend(&g_ut_subsystem_deps[0]);
 
 	global_rc = -1;
-	spdk_subsystem_init(NULL);
+	spdk_subsystem_init(ut_event_fn, NULL);
 	CU_ASSERT(global_rc != 0);
 
 	/*
@@ -258,7 +226,7 @@ subsystem_sort_test_missing_dependency(void)
 	spdk_add_subsystem_depend(&g_ut_subsystem_deps[0]);
 
 	global_rc = -1;
-	spdk_subsystem_init(NULL);
+	spdk_subsystem_init(ut_event_fn, NULL);
 	CU_ASSERT(global_rc != 0);
 
 }

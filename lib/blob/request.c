@@ -51,7 +51,7 @@ spdk_bs_call_cpl(struct spdk_bs_cpl *cpl, int bserrno)
 		break;
 	case SPDK_BS_CPL_TYPE_BS_HANDLE:
 		cpl->u.bs_handle.cb_fn(cpl->u.bs_handle.cb_arg,
-				       cpl->u.bs_handle.bs,
+				       bserrno == 0 ? cpl->u.bs_handle.bs : NULL,
 				       bserrno);
 		break;
 	case SPDK_BS_CPL_TYPE_BLOB_BASIC:
@@ -60,12 +60,12 @@ spdk_bs_call_cpl(struct spdk_bs_cpl *cpl, int bserrno)
 		break;
 	case SPDK_BS_CPL_TYPE_BLOBID:
 		cpl->u.blobid.cb_fn(cpl->u.blobid.cb_arg,
-				    cpl->u.blobid.blobid,
+				    bserrno == 0 ? cpl->u.blobid.blobid : SPDK_BLOBID_INVALID,
 				    bserrno);
 		break;
 	case SPDK_BS_CPL_TYPE_BLOB_HANDLE:
 		cpl->u.blob_handle.cb_fn(cpl->u.blob_handle.cb_arg,
-					 cpl->u.blob_handle.blob,
+					 bserrno == 0 ? cpl->u.blob_handle.blob : NULL,
 					 bserrno);
 		break;
 	case SPDK_BS_CPL_TYPE_NESTED_SEQUENCE:
@@ -107,7 +107,7 @@ spdk_bs_sequence_start(struct spdk_io_channel *_channel,
 	struct spdk_bs_request_set	*set;
 
 	channel = spdk_io_channel_get_ctx(_channel);
-
+	assert(channel != NULL);
 	set = TAILQ_FIRST(&channel->reqs);
 	if (!set) {
 		return NULL;
@@ -311,7 +311,7 @@ spdk_bs_batch_open(struct spdk_io_channel *_channel,
 	struct spdk_bs_request_set	*set;
 
 	channel = spdk_io_channel_get_ctx(_channel);
-
+	assert(channel != NULL);
 	set = TAILQ_FIRST(&channel->reqs);
 	if (!set) {
 		return NULL;
@@ -405,83 +405,6 @@ spdk_bs_batch_write_zeroes_dev(spdk_bs_batch_t *batch,
 				   &set->cb_args);
 }
 
-static void
-spdk_bs_batch_blob_op_complete(void *arg, int bserrno)
-{
-	/* TODO: spdk_bs_batch_completion does not actually use the channel parameter -
-	 *  just pass NULL here instead of getting the channel from the set cb_arg.
-	 */
-	spdk_bs_batch_completion(NULL, arg, bserrno);
-}
-
-void
-spdk_bs_batch_read_blob(spdk_bs_batch_t *batch, struct spdk_blob *blob,
-			void *payload, uint64_t offset, uint64_t length)
-{
-	struct spdk_bs_request_set	*set = (struct spdk_bs_request_set *)batch;
-	struct spdk_bs_channel		*channel = set->channel;
-
-	SPDK_DEBUGLOG(SPDK_LOG_BLOB_RW, "Reading %" PRIu64 " pages from offset %" PRIu64 "\n", length,
-		      offset);
-
-	set->u.batch.outstanding_ops++;
-	spdk_blob_io_read(blob, spdk_io_channel_from_ctx(channel), payload, offset,
-			  length, spdk_bs_batch_blob_op_complete, set);
-}
-
-void
-spdk_bs_batch_write_blob(spdk_bs_batch_t *batch, struct spdk_blob *blob,
-			 void *payload, uint64_t offset, uint64_t length)
-{
-	struct spdk_bs_request_set	*set = (struct spdk_bs_request_set *)batch;
-	struct spdk_bs_channel		*channel = set->channel;
-
-	SPDK_DEBUGLOG(SPDK_LOG_BLOB_RW, "Writing %" PRIu64 " pages from offset %" PRIu64 "\n", length,
-		      offset);
-
-	set->u.batch.outstanding_ops++;
-	spdk_blob_io_write(blob, spdk_io_channel_from_ctx(channel), payload, offset,
-			   length, spdk_bs_batch_blob_op_complete, set);
-}
-
-void
-spdk_bs_batch_unmap_blob(spdk_bs_batch_t *batch, struct spdk_blob *blob,
-			 uint64_t offset, uint64_t length)
-{
-	struct spdk_bs_request_set	*set = (struct spdk_bs_request_set *)batch;
-	struct spdk_bs_channel		*channel = set->channel;
-
-	SPDK_DEBUGLOG(SPDK_LOG_BLOB_RW, "Unmapping %" PRIu64 " pages from offset %" PRIu64 "\n", length,
-		      offset);
-
-	set->u.batch.outstanding_ops++;
-	spdk_blob_io_unmap(blob, spdk_io_channel_from_ctx(channel), offset, length,
-			   spdk_bs_batch_blob_op_complete, set);
-}
-
-void
-spdk_bs_batch_write_zeroes_blob(spdk_bs_batch_t *batch, struct spdk_blob *blob,
-				uint64_t offset, uint64_t length)
-{
-	struct spdk_bs_request_set	*set = (struct spdk_bs_request_set *)batch;
-	struct spdk_bs_channel		*channel = set->channel;
-
-	SPDK_DEBUGLOG(SPDK_LOG_BLOB_RW, "Zeroing %" PRIu64 " pages from offset %" PRIu64 "\n", length,
-		      offset);
-
-	set->u.batch.outstanding_ops++;
-	spdk_blob_io_write_zeroes(blob, spdk_io_channel_from_ctx(channel), offset, length,
-				  spdk_bs_batch_blob_op_complete, set);
-}
-
-void
-spdk_bs_batch_set_errno(spdk_bs_batch_t *batch, int bserrno)
-{
-	struct spdk_bs_request_set	*set = (struct spdk_bs_request_set *)batch;
-
-	set->bserrno = bserrno;
-}
-
 void
 spdk_bs_batch_close(spdk_bs_batch_t *batch)
 {
@@ -543,7 +466,7 @@ spdk_bs_user_op_alloc(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl,
 	struct spdk_bs_user_op_args	*args;
 
 	channel = spdk_io_channel_get_ctx(_channel);
-
+	assert(channel != NULL);
 	set = TAILQ_FIRST(&channel->reqs);
 	if (!set) {
 		return NULL;

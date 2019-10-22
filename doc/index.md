@@ -18,14 +18,11 @@
 # Miscellaneous
 @copydoc misc
 
-# Modules
-@copydoc modules
+# Driver Modules
+@copydoc driver_modules
 
 # Tools
 @copydoc tools
-
-# Experimental Tools
-@copydoc experimental_tools
 
 # Performance Reports
 @copydoc performance_reports

@@ -33,7 +33,8 @@
 
 #include "nvme_internal.h"
 
-static struct nvme_request *_nvme_ns_cmd_rw(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
+static inline struct nvme_request *_nvme_ns_cmd_rw(struct spdk_nvme_ns *ns,
+		struct spdk_nvme_qpair *qpair,
 		const struct nvme_payload *payload, uint32_t payload_offset, uint32_t md_offset,
 		uint64_t lba, uint32_t lba_count, spdk_nvme_cmd_cb cb_fn,
 		void *cb_arg, uint32_t opc, uint32_t io_flags,
@@ -44,88 +45,21 @@ static bool
 spdk_nvme_ns_check_request_length(uint32_t lba_count, uint32_t sectors_per_max_io,
 				  uint32_t sectors_per_stripe, uint32_t qdepth)
 {
-	uint32_t child_per_io;
+	uint32_t child_per_io = UINT32_MAX;
 
+	/* After a namespace is destroyed(e.g. hotplug), all the fields associated with the
+	 * namespace will be cleared to zero, the function will return TRUE for this case,
+	 * and -EINVAL will be returned to caller.
+	 */
 	if (sectors_per_stripe > 0) {
 		child_per_io = (lba_count + sectors_per_stripe - 1) / sectors_per_stripe;
-	} else {
+	} else if (sectors_per_max_io > 0) {
 		child_per_io = (lba_count + sectors_per_max_io - 1) / sectors_per_max_io;
 	}
 
 	SPDK_DEBUGLOG(SPDK_LOG_NVME, "checking maximum i/o length %d\n", child_per_io);
 
 	return child_per_io >= qdepth;
-}
-
-static void
-nvme_cb_complete_child(void *child_arg, const struct spdk_nvme_cpl *cpl)
-{
-	struct nvme_request *child = child_arg;
-	struct nvme_request *parent = child->parent;
-
-	nvme_request_remove_child(parent, child);
-
-	if (spdk_nvme_cpl_is_error(cpl)) {
-		memcpy(&parent->parent_status, cpl, sizeof(*cpl));
-	}
-
-	if (parent->num_children == 0) {
-		nvme_complete_request(parent, &parent->parent_status);
-		nvme_free_request(parent);
-	}
-}
-
-static void
-nvme_request_add_child(struct nvme_request *parent, struct nvme_request *child)
-{
-	assert(parent->num_children != UINT16_MAX);
-
-	if (parent->num_children == 0) {
-		/*
-		 * Defer initialization of the children TAILQ since it falls
-		 *  on a separate cacheline.  This ensures we do not touch this
-		 *  cacheline except on request splitting cases, which are
-		 *  relatively rare.
-		 */
-		TAILQ_INIT(&parent->children);
-		parent->parent = NULL;
-		memset(&parent->parent_status, 0, sizeof(struct spdk_nvme_cpl));
-	}
-
-	parent->num_children++;
-	TAILQ_INSERT_TAIL(&parent->children, child, child_tailq);
-	child->parent = parent;
-	child->cb_fn = nvme_cb_complete_child;
-	child->cb_arg = child;
-}
-
-void
-nvme_request_remove_child(struct nvme_request *parent, struct nvme_request *child)
-{
-	assert(parent != NULL);
-	assert(child != NULL);
-	assert(child->parent == parent);
-	assert(parent->num_children != 0);
-
-	parent->num_children--;
-	TAILQ_REMOVE(&parent->children, child, child_tailq);
-}
-
-static void
-nvme_request_free_children(struct nvme_request *req)
-{
-	struct nvme_request *child, *tmp;
-
-	if (req->num_children == 0) {
-		return;
-	}
-
-	/* free all child nvme_request */
-	TAILQ_FOREACH_SAFE(child, &req->children, child_tailq, tmp) {
-		nvme_request_remove_child(req, child);
-		nvme_request_free_children(child);
-		nvme_free_request(child);
-	}
 }
 
 static struct nvme_request *
@@ -382,7 +316,7 @@ _nvme_ns_cmd_split_request_sgl(struct spdk_nvme_ns *ns,
 		req_current_length += sge_length;
 		num_sges++;
 
-		if (num_sges < max_sges) {
+		if (num_sges < max_sges && req_current_length < req->payload_size) {
 			continue;
 		}
 
@@ -430,7 +364,7 @@ _nvme_ns_cmd_split_request_sgl(struct spdk_nvme_ns *ns,
 	return req;
 }
 
-static struct nvme_request *
+static inline struct nvme_request *
 _nvme_ns_cmd_rw(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
 		const struct nvme_payload *payload, uint32_t payload_offset, uint32_t md_offset,
 		uint64_t lba, uint32_t lba_count, spdk_nvme_cmd_cb cb_fn, void *cb_arg, uint32_t opc,
@@ -443,6 +377,8 @@ _nvme_ns_cmd_rw(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
 
 	if (io_flags & 0xFFFF) {
 		/* The bottom 16 bits must be empty */
+		SPDK_ERRLOG("io_flags 0x%x bottom 16 bits is not empty\n",
+			    io_flags);
 		return NULL;
 	}
 
@@ -838,6 +774,35 @@ spdk_nvme_ns_cmd_write_zeroes(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *q
 	*tmp_lba = lba;
 	cmd->cdw12 = lba_count - 1;
 	cmd->cdw12 |= io_flags;
+
+	return nvme_qpair_submit_request(qpair, req);
+}
+
+int
+spdk_nvme_ns_cmd_write_uncorrectable(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
+				     uint64_t lba, uint32_t lba_count,
+				     spdk_nvme_cmd_cb cb_fn, void *cb_arg)
+{
+	struct nvme_request	*req;
+	struct spdk_nvme_cmd	*cmd;
+	uint64_t		*tmp_lba;
+
+	if (lba_count == 0 || lba_count > UINT16_MAX + 1) {
+		return -EINVAL;
+	}
+
+	req = nvme_allocate_request_null(qpair, cb_fn, cb_arg);
+	if (req == NULL) {
+		return -ENOMEM;
+	}
+
+	cmd = &req->cmd;
+	cmd->opc = SPDK_NVME_OPC_WRITE_UNCORRECTABLE;
+	cmd->nsid = ns->id;
+
+	tmp_lba = (uint64_t *)&cmd->cdw10;
+	*tmp_lba = lba;
+	cmd->cdw12 = lba_count - 1;
 
 	return nvme_qpair_submit_request(qpair, req);
 }

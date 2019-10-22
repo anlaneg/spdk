@@ -70,6 +70,19 @@ typedef uint64_t spdk_blob_id;
 #define SPDK_BLOBID_INVALID	(uint64_t)-1
 #define SPDK_BLOBSTORE_TYPE_LENGTH 16
 
+enum blob_clear_method {
+	BLOB_CLEAR_WITH_DEFAULT,
+	BLOB_CLEAR_WITH_NONE,
+	BLOB_CLEAR_WITH_UNMAP,
+	BLOB_CLEAR_WITH_WRITE_ZEROES,
+};
+
+enum bs_clear_method {
+	BS_CLEAR_WITH_UNMAP,
+	BS_CLEAR_WITH_WRITE_ZEROES,
+	BS_CLEAR_WITH_NONE,
+};
+
 struct spdk_blob_store;
 struct spdk_io_channel;
 struct spdk_blob;
@@ -199,6 +212,9 @@ struct spdk_bs_opts {
 	/** Maximum simultaneous operations per channel */
 	uint32_t max_channel_ops;
 
+	/** Clear method */
+	enum bs_clear_method  clear_method;
+
 	/** Blobstore type */
 	struct spdk_bs_type bstype;
 
@@ -317,6 +333,15 @@ uint64_t spdk_bs_get_cluster_size(struct spdk_blob_store *bs);
 uint64_t spdk_bs_get_page_size(struct spdk_blob_store *bs);
 
 /**
+ * Get the io unit size in bytes.
+ *
+ * \param bs blobstore to query.
+ *
+ * \return io unit size.
+ */
+uint64_t spdk_bs_get_io_unit_size(struct spdk_blob_store *bs);
+
+/**
  * Get the number of free clusters.
  *
  * \param bs blobstore to query.
@@ -351,6 +376,15 @@ spdk_blob_id spdk_blob_get_id(struct spdk_blob *blob);
  * \return the number of pages.
  */
 uint64_t spdk_blob_get_num_pages(struct spdk_blob *blob);
+
+/**
+ * Get the number of io_units allocated to the blob.
+ *
+ * \param blob Blob struct to query.
+ *
+ * \return the number of io_units.
+ */
+uint64_t spdk_blob_get_num_io_units(struct spdk_blob *blob);
 
 /**
  * Get the number of clusters allocated to the blob.
@@ -554,6 +588,17 @@ void spdk_bs_inflate_blob(struct spdk_blob_store *bs, struct spdk_io_channel *ch
 void spdk_bs_blob_decouple_parent(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
 				  spdk_blob_id blobid, spdk_blob_op_complete cb_fn, void *cb_arg);
 
+struct spdk_blob_open_opts {
+	enum blob_clear_method  clear_method;
+};
+
+/**
+ * Initialize a spdk_blob_open_opts structure to the default blob option values.
+ *
+ * \param opts spdk_blob_open_opts structure to initialize.
+ */
+void spdk_blob_open_opts_init(struct spdk_blob_open_opts *opts);
+
 /**
  * Open a blob from the given blobstore.
  *
@@ -564,6 +609,18 @@ void spdk_bs_blob_decouple_parent(struct spdk_blob_store *bs, struct spdk_io_cha
  */
 void spdk_bs_open_blob(struct spdk_blob_store *bs, spdk_blob_id blobid,
 		       spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
+
+/**
+ * Open a blob from the given blobstore with additional options.
+ *
+ * \param bs blobstore.
+ * \param blobid The id of the blob to open.
+ * \param opts The structure which contains the option values for the blob.
+ * \param cb_fn Called when the operation is complete.
+ * \param cb_arg Argument passed to function cb_fn.
+ */
+void spdk_bs_open_blob_ext(struct spdk_blob_store *bs, spdk_blob_id blobid,
+			   struct spdk_blob_open_opts *opts, spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
 
 /**
  * Resize a blob to 'sz' clusters. These changes are not persisted to disk until
@@ -630,8 +687,8 @@ void spdk_bs_free_io_channel(struct spdk_io_channel *channel);
  * \param blob Blob to write.
  * \param channel The I/O channel used to submit requests.
  * \param payload The specified buffer which should contain the data to be written.
- * \param offset Offset is in pages from the beginning of the blob.
- * \param length Size of data in pages.
+ * \param offset Offset is in io units from the beginning of the blob.
+ * \param length Size of data in io units.
  * \param cb_fn Called when the operation is complete.
  * \param cb_arg Argument passed to function cb_fn.
  */
@@ -645,8 +702,8 @@ void spdk_blob_io_write(struct spdk_blob *blob, struct spdk_io_channel *channel,
  * \param blob Blob to read.
  * \param channel The I/O channel used to submit requests.
  * \param payload The specified buffer which will store the obtained data.
- * \param offset Offset is in pages from the beginning of the blob.
- * \param length Size of data in pages.
+ * \param offset Offset is in io units from the beginning of the blob.
+ * \param length Size of data in io units.
  * \param cb_fn Called when the operation is complete.
  * \param cb_arg Argument passed to function cb_fn.
  */
@@ -655,15 +712,15 @@ void spdk_blob_io_read(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		       spdk_blob_op_complete cb_fn, void *cb_arg);
 
 /**
- * Write the data described by 'iov' to 'length' pages beginning at 'offset' pages
+ * Write the data described by 'iov' to 'length' io_units beginning at 'offset' io_units
  * into the blob.
  *
  * \param blob Blob to write.
  * \param channel I/O channel used to submit requests.
  * \param iov The pointer points to an array of iovec structures.
  * \param iovcnt The number of buffers.
- * \param offset Offset is in pages from the beginning of the blob.
- * \param length Size of data in pages.
+ * \param offset Offset is in io units from the beginning of the blob.
+ * \param length Size of data in io units.
  * \param cb_fn Called when the operation is complete.
  * \param cb_arg Argument passed to function cb_fn.
  */
@@ -672,15 +729,15 @@ void spdk_blob_io_writev(struct spdk_blob *blob, struct spdk_io_channel *channel
 			 spdk_blob_op_complete cb_fn, void *cb_arg);
 
 /**
- * Read 'length' pages starting at 'offset' pages into the blob into the memory
+ * Read 'length' io_units starting at 'offset' io_units into the blob into the memory
  * described by 'iov'.
  *
  * \param blob Blob to read.
  * \param channel I/O channel used to submit requests.
  * \param iov The pointer points to an array of iovec structures.
  * \param iovcnt The number of buffers.
- * \param offset Offset is in pages from the beginning of the blob.
- * \param length Size of data in pages.
+ * \param offset Offset is in io units from the beginning of the blob.
+ * \param length Size of data in io units.
  * \param cb_fn Called when the operation is complete.
  * \param cb_arg Argument passed to function cb_fn.
  */
@@ -689,13 +746,13 @@ void spdk_blob_io_readv(struct spdk_blob *blob, struct spdk_io_channel *channel,
 			spdk_blob_op_complete cb_fn, void *cb_arg);
 
 /**
- * Unmap 'length' pages beginning at 'offset' pages on the blob as unused. Unmapped
- * pages may allow the underlying storage media to behave more effciently.
+ * Unmap 'length' io_units beginning at 'offset' io_units on the blob as unused. Unmapped
+ * io_units may allow the underlying storage media to behave more effciently.
  *
  * \param blob Blob to unmap.
  * \param channel I/O channel used to submit requests.
- * \param offset Offset is in pages from the beginning of the blob.
- * \param length Size of unmap area in pages.
+ * \param offset Offset is in io units from the beginning of the blob.
+ * \param length Size of unmap area in io_units.
  * \param cb_fn Called when the operation is complete.
  * \param cb_arg Argument passed to function cb_fn.
  */
@@ -707,8 +764,8 @@ void spdk_blob_io_unmap(struct spdk_blob *blob, struct spdk_io_channel *channel,
  *
  * \param blob Blob to write.
  * \param channel I/O channel used to submit requests.
- * \param offset Offset is in pages from the beginning of the blob.
- * \param length Size of data in pages.
+ * \param offset Offset is in io units from the beginning of the blob.
+ * \param length Size of data in io units.
  * \param cb_fn Called when the operation is complete.
  * \param cb_arg Argument passed to function cb_fn.
  */

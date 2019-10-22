@@ -1,17 +1,15 @@
 # NVMe over Fabrics Target {#nvmf}
 
 @sa @ref nvme_fabrics_host
-
+@sa @ref nvmf_tgt_tracepoints
 
 # NVMe-oF Target Getting Started Guide {#nvmf_getting_started}
 
-The NVMe over Fabrics target is a user space application that presents block devices over the
-network using RDMA. It requires an RDMA-capable NIC with its corresponding OFED software package
-installed to run. The target should work on all flavors of RDMA, but it is currently tested against
-Mellanox NICs (RoCEv2) and Chelsio NICs (iWARP).
+The SPDK NVMe over Fabrics target is a user space application that presents block devices over a fabrics
+such as Ethernet, Infiniband or Fibre Channel. SPDK currently supports RDMA and TCP transports.
 
-The NVMe over Fabrics specification defines subsystems that can be exported over the network. SPDK
-has chosen to call the software that exports these subsystems a "target", which is the term used
+The NVMe over Fabrics specification defines subsystems that can be exported over different transports.
+SPDK has chosen to call the software that exports these subsystems a "target", which is the term used
 for iSCSI. The specification refers to the "client" that connects to the target as a "host". Many
 people will also refer to the host as an "initiator", which is the equivalent thing in iSCSI
 parlance. SPDK will try to stick to the terms "target" and "host" to match the specification.
@@ -23,11 +21,15 @@ If you want to kill the application using signal, make sure use the SIGTERM, the
 will release all the share memory resource before exit, the SIGKILL will make the share memory
 resource have no chance to be released by application, you may need to release the resource manually.
 
-## Prerequisites {#nvmf_prereqs}
+## RDMA transport support {#nvmf_rdma_transport}
 
-This guide starts by assuming that you can already build the standard SPDK distribution on your
-platform. By default, the NVMe over Fabrics target is not built. To build nvmf_tgt there are some
-additional dependencies.
+It requires an RDMA-capable NIC with its corresponding OFED (OpenFabrics Enterprise Distribution)
+software package installed to run. Maybe OS distributions provide packages, but OFED is also
+available [here](https://downloads.openfabrics.org/OFED/).
+
+### Prerequisites {#nvmf_prereqs}
+
+To build nvmf_tgt with the RDMA transport, there are some additional dependencies.
 
 Fedora:
 ~~~{.sh}
@@ -48,15 +50,16 @@ make
 
 Once built, the binary will be in `app/nvmf_tgt`.
 
-## Prerequisites for InfiniBand/RDMA Verbs {#nvmf_prereqs_verbs}
+### Prerequisites for InfiniBand/RDMA Verbs {#nvmf_prereqs_verbs}
 
-Before starting our NVMe-oF target we must load the InfiniBand and RDMA modules that allow
-userspace processes to use InfiniBand/RDMA verbs directly.
+Before starting our NVMe-oF target with the RDMA transport we must load the InfiniBand and RDMA modules
+that allow userspace processes to use InfiniBand/RDMA verbs directly.
 
 ~~~{.sh}
 modprobe ib_cm
 modprobe ib_core
-modprobe ib_ucm
+# Please note that ib_ucm does not exist in newer versions of the kernel and is not required.
+modprobe ib_ucm || true
 modprobe ib_umad
 modprobe ib_uverbs
 modprobe iw_cm
@@ -64,11 +67,17 @@ modprobe rdma_cm
 modprobe rdma_ucm
 ~~~
 
-## Prerequisites for RDMA NICs {#nvmf_prereqs_rdma_nics}
+### Prerequisites for RDMA NICs {#nvmf_prereqs_rdma_nics}
 
 Before starting our NVMe-oF target we must detect RDMA NICs and assign them IP addresses.
 
-### Mellanox ConnectX-3 RDMA NICs
+### Finding RDMA NICs and associated network interfaces
+
+~~~{.sh}
+ls /sys/class/infiniband/*/device/net
+~~~
+
+#### Mellanox ConnectX-3 RDMA NICs
 
 ~~~{.sh}
 modprobe mlx4_core
@@ -76,77 +85,98 @@ modprobe mlx4_ib
 modprobe mlx4_en
 ~~~
 
-### Mellanox ConnectX-4 RDMA NICs
+#### Mellanox ConnectX-4 RDMA NICs
 
 ~~~{.sh}
 modprobe mlx5_core
 modprobe mlx5_ib
 ~~~
 
-### Assigning IP addresses to RDMA NICs
+#### Assigning IP addresses to RDMA NICs
 
 ~~~{.sh}
 ifconfig eth1 192.168.100.8 netmask 255.255.255.0 up
 ifconfig eth2 192.168.100.9 netmask 255.255.255.0 up
 ~~~
 
+### RDMA Limitations {#nvmf_rdma_limitations}
+
+As RDMA NICs put a limitation on the number of memory regions registered, the SPDK NVMe-oF
+target application may eventually start failing to allocate more DMA-able memory. This is
+an imperfection of the DPDK dynamic memory management and is most likely to occur with too
+many 2MB hugepages reserved at runtime. One type of memory bottleneck is the number of NIC memory
+regions, e.g., some NICs report as many as 2048 for the maximum number of memory regions. This
+gives us a 4GB memory limit with 2MB hugepages for the total memory regions. It can be overcome by
+using 1GB hugepages or by pre-reserving memory at application startup with `--mem-size` or `-s`
+option. All pre-reserved memory will be registered as a single region, but won't be returned to the
+system until the SPDK application is terminated.
+
+## TCP transport support {#nvmf_tcp_transport}
+
+The transport is built into the nvmf_tgt by default, and it does not need any special libraries.
+
 ## Configuring the SPDK NVMe over Fabrics Target {#nvmf_config}
 
-A `nvmf_tgt`-specific configuration file is used to configure the NVMe over Fabrics target. This
-file's primary purpose is to define subsystems. A fully documented example configuration file is
-located at `etc/spdk/nvmf.conf.in`.
+An NVMe over Fabrics target can be configured using JSON RPCs.
+The basic RPCs needed to configure the NVMe-oF subsystem are detailed below. More information about
+working with NVMe over Fabrics specific RPCs can be found on the @ref jsonrpc_components_nvmf_tgt RPC page.
 
-You should make a copy of the example configuration file, modify it to suit your environment, and
-then run the nvmf_tgt application and pass it the configuration file using the -c option. Right now,
-the target requires elevated privileges (root) to run.
+Using .ini style configuration files for configuration of the NVMe-oF target is deprecated and should
+be replaced with JSON based RPCs. .ini style configuration files can be converted to json format by way
+of the new script `scripts/config_converter.py`.
+
+## FC transport support {#nvmf_fc_transport}
+
+To build nvmf_tgt with the FC transport, there is an additional FC LLD (Low Level Driver) code dependency.
+Please contact your FC vendor for instructions to obtain FC driver module.
+
+### Broadcom FC LLD code
+FC LLD driver for Broadcom FC NVMe capable adapters can be obtained from,
+https://github.com/ecdufcdrvr/bcmufctdrvr.
+
+### Fetch FC LLD module and then build SPDK with FC enabled:
+After cloning SPDK repo and initialize submodules, FC LLD library is built which then can be linked with
+the fc transport.
 
 ~~~{.sh}
-app/nvmf_tgt/nvmf_tgt -c /path/to/nvmf.conf
+git clone https://github.com/spdk/spdk spdk
+git clone https://github.com/ecdufcdrvr/bcmufctdrvr fc
+cd spdk
+git submodule update --init
+cd ../fc
+make DPDK_DIR=../spdk/dpdk/build SPDK_DIR=../spdk
+cd ../spdk
+./configure --with-fc=../fc/build
+make
 ~~~
 
-### Subsystem Configuration {#nvmf_config_subsystem}
+### Using RPCs {#nvmf_config_rpc}
 
-The `[Subsystem]` section in the configuration file is used to configure
-subysystems for the NVMe-oF target.
-
-This example shows two local PCIe NVMe devices exposed as separate NVMe-oF target subsystems:
+Start the nvmf_tgt application with elevated privileges. Once the target is started,
+the nvmf_create_transport rpc can be used to initialize a given transport. Below is an
+example where the target is started and configured with two different transports.
+The RDMA transport is configured with an I/O unit size of 8192 bytes, 4 max qpairs per controller,
+and an in capsule data size of 0 bytes. The TCP transport is configured with an I/O unit size of
+16384 bytes, 8 max qpairs per controller, and an in capsule data size of 8192 bytes.
 
 ~~~{.sh}
-[Nvme]
-TransportID "trtype:PCIe traddr:0000:02:00.0" Nvme0
-TransportID "trtype:PCIe traddr:0000:82:00.0" Nvme1
-
-[Subsystem1]
-NQN nqn.2016-06.io.spdk:cnode1
-Listen RDMA 192.168.100.8:4420
-AllowAnyHost No
-Host nqn.2016-06.io.spdk:init
-SN SPDK00000000000001
-Namespace Nvme0n1 1
-
-[Subsystem2]
-NQN nqn.2016-06.io.spdk:cnode2
-Listen RDMA 192.168.100.9:4420
-AllowAnyHost Yes
-SN SPDK00000000000002
-Namespace Nvme1n1 1
+app/nvmf_tgt/nvmf_tgt
+scripts/rpc.py nvmf_create_transport -t RDMA -u 8192 -p 4 -c 0
+scripts/rpc.py nvmf_create_transport -t TCP -u 16384 -p 8 -c 8192
 ~~~
 
-Any bdev may be presented as a namespace.
-See @ref bdev for details on setting up bdevs.
-For example, to create a virtual controller with two namespaces backed by the malloc bdevs
-named Malloc0 and Malloc1 and made available as NSID 1 and 2:
+Below is an example of creating a malloc bdev and assigning it to a subsystem. Adjust the bdevs,
+NQN, serial number, and IP address with RDMA transport to your own circumstances. If you replace
+"rdma" with "TCP", then the subsystem will add a listener with TCP transport.
+
 ~~~{.sh}
-[Subsystem3]
-  NQN nqn.2016-06.io.spdk:cnode3
-  Listen RDMA 192.168.2.21:4420
-  AllowAnyHost Yes
-  SN SPDK00000000000003
-  Namespace Malloc0 1
-  Namespace Malloc1 2
+scripts/rpc.py bdev_malloc_create -b Malloc0 512 512
+scripts/rpc.py nvmf_create_subsystem nqn.2016-06.io.spdk:cnode1 -a -s SPDK00000000000001 -d SPDK_Controller1
+scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Malloc0
+scripts/rpc.py nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 -t rdma -a 192.168.100.8 -s 4420
 ~~~
 
-#### NQN Formal Definition
+### NQN Formal Definition
 
 NVMe qualified names or NQNs are defined in section 7.9 of the
 [NVMe specification](http://nvmexpress.org/wp-content/uploads/NVM_Express_Revision_1.3.pdf). SPDK has attempted to
@@ -196,7 +226,7 @@ alphabetic hex digits in their NQNs.
 SPDK uses the [DPDK Environment Abstraction Layer](http://dpdk.org/doc/guides/prog_guide/env_abstraction_layer.html)
 to gain access to hardware resources such as huge memory pages and CPU core(s). DPDK EAL provides
 functions to assign threads to specific cores.
-To ensure the SPDK NVMe-oF target has the best performance, configure the RNICs and NVMe devices to
+To ensure the SPDK NVMe-oF target has the best performance, configure the NICs and NVMe devices to
 be located on the same NUMA node.
 
 The `-m` core mask option specifies a bit mask of the CPU cores that
@@ -209,13 +239,18 @@ app/nvmf_tgt/nvmf_tgt -m 0xF000000
 ## Configuring the Linux NVMe over Fabrics Host {#nvmf_host}
 
 Both the Linux kernel and SPDK implement an NVMe over Fabrics host.
-The Linux kernel NVMe-oF RDMA host support is provided by the `nvme-rdma` driver.
+The Linux kernel NVMe-oF RDMA host support is provided by the `nvme-rdma` driver
+(to support RDMA transport) and `nvme-tcp` (to support TCP transport). And the
+following shows two different commands for loading the driver.
 
 ~~~{.sh}
 modprobe nvme-rdma
+modprobe nvme-tcp
 ~~~
 
 The nvme-cli tool may be used to interface with the Linux kernel NVMe over Fabrics host.
+See below for examples of the discover, connect and disconnect commands. In all three instances, the
+transport can be changed to TCP by interchanging 'rdma' for 'tcp'.
 
 Discovery:
 ~~~{.sh}
@@ -231,3 +266,8 @@ Disconnect:
 ~~~{.sh}
 nvme disconnect -n "nqn.2016-06.io.spdk:cnode1"
 ~~~
+
+## Enabling NVMe-oF target tracepoints for offline analysis and debug {#nvmf_trace}
+
+SPDK has a tracing framework for capturing low-level event information at runtime.
+@ref nvmf_tgt_tracepoints enable analysis of both performance and application crashes.

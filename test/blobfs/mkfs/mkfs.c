@@ -33,77 +33,43 @@
 
 #include "spdk/stdinc.h"
 
-#include "spdk/blobfs.h"
-#include "spdk/bdev.h"
 #include "spdk/event.h"
-#include "spdk/blob_bdev.h"
+#include "spdk/blobfs.h"
+#include "spdk/blobfs_bdev.h"
 #include "spdk/log.h"
 #include "spdk/string.h"
 
-struct spdk_bs_dev *g_bs_dev;
 const char *g_bdev_name;
 static uint64_t g_cluster_size;
 
 static void
-stop_cb(void *ctx, int fserrno)
+shutdown_cb(void *cb_arg, int fserrno)
 {
+	if (fserrno) {
+		printf("\nFailed to initialize filesystem on bdev %s...", g_bdev_name);
+	}
+
+	printf("done.\n");
+
 	spdk_app_stop(0);
 }
 
 static void
-shutdown_cb(void *arg1, void *arg2)
+spdk_mkfs_run(void *arg1)
 {
-	struct spdk_filesystem *fs = arg1;
-
-	printf("done.\n");
-	spdk_fs_unload(fs, stop_cb, NULL);
-}
-
-static void
-init_cb(void *ctx, struct spdk_filesystem *fs, int fserrno)
-{
-	struct spdk_event *event;
-
-	event = spdk_event_allocate(0, shutdown_cb, fs, NULL);
-	spdk_event_call(event);
-}
-
-static void
-spdk_mkfs_run(void *arg1, void *arg2)
-{
-	struct spdk_bdev *bdev;
-	struct spdk_blobfs_opts blobfs_opt;
-
-	bdev = spdk_bdev_get_by_name(g_bdev_name);
-
-	if (bdev == NULL) {
-		SPDK_ERRLOG("bdev %s not found\n", g_bdev_name);
-		spdk_app_stop(-1);
-		return;
-	}
-
 	printf("Initializing filesystem on bdev %s...", g_bdev_name);
 	fflush(stdout);
 
-	spdk_fs_opts_init(&blobfs_opt);
-	if (g_cluster_size) {
-		blobfs_opt.cluster_sz = g_cluster_size;
-	}
-	g_bs_dev = spdk_bdev_create_bs_dev(bdev, NULL, NULL);
-	if (blobfs_opt.cluster_sz) {
-		spdk_fs_init(g_bs_dev, &blobfs_opt, NULL, init_cb, NULL);
-	} else {
-		spdk_fs_init(g_bs_dev, NULL, NULL, init_cb, NULL);
-	}
+	spdk_blobfs_bdev_create(g_bdev_name, g_cluster_size, shutdown_cb, NULL);
 }
 
 static void
 mkfs_usage(void)
 {
-	printf(" -C cluster size\n");
+	printf(" -C <size>                 cluster size\n");
 }
 
-static void
+static int
 mkfs_parse_arg(int ch, char *arg)
 {
 	bool has_prefix;
@@ -113,9 +79,9 @@ mkfs_parse_arg(int ch, char *arg)
 		spdk_parse_capacity(arg, &g_cluster_size, &has_prefix);
 		break;
 	default:
-		break;
+		return -EINVAL;
 	}
-
+	return 0;
 }
 
 int main(int argc, char **argv)
@@ -132,18 +98,17 @@ int main(int argc, char **argv)
 	opts.name = "spdk_mkfs";
 	opts.config_file = argv[1];
 	opts.reactor_mask = "0x3";
-	opts.mem_size = 1024;
 	opts.shutdown_cb = NULL;
 
 	spdk_fs_set_cache_size(512);
 	g_bdev_name = argv[2];
-	if ((rc = spdk_app_parse_args(argc, argv, &opts, "C:",
+	if ((rc = spdk_app_parse_args(argc, argv, &opts, "C:", NULL,
 				      mkfs_parse_arg, mkfs_usage)) !=
 	    SPDK_APP_PARSE_ARGS_SUCCESS) {
 		exit(rc);
 	}
 
-	rc = spdk_app_start(&opts, spdk_mkfs_run, NULL, NULL);
+	rc = spdk_app_start(&opts, spdk_mkfs_run, NULL);
 	spdk_app_fini();
 
 	return rc;

@@ -36,7 +36,8 @@ include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
 C_SRCS = log.c log_flags.c
 LIBNAME = log
-
-DIRS-y = rpc
+ifeq ($(CONFIG_LOG_BACKTRACE),y)
+LOCAL_SYS_LIBS += -lunwind
+endif
 
 include $(SPDK_ROOT_DIR)/mk/spdk.lib.mk

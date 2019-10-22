@@ -32,12 +32,11 @@
 #
 
 SPDK_ROOT_DIR := $(abspath $(CURDIR)/../../..)
-include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
 APP = overhead
 
 ifeq ($(OS),Linux)
-LIBS += -laio
+SYS_LIBS += -laio
 CFLAGS += -DHAVE_LIBAIO
 endif
 

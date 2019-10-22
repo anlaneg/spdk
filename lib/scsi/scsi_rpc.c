@@ -38,7 +38,7 @@
 #include "spdk/util.h"
 
 static void
-spdk_rpc_get_scsi_devices(struct spdk_jsonrpc_request *request,
+spdk_rpc_scsi_get_devices(struct spdk_jsonrpc_request *request,
 			  const struct spdk_json_val *params)
 {
 	struct spdk_json_write_ctx *w;
@@ -47,15 +47,11 @@ spdk_rpc_get_scsi_devices(struct spdk_jsonrpc_request *request,
 
 	if (params != NULL) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-						 "get_scsi_devices requires no parameters");
+						 "scsi_get_devices requires no parameters");
 		return;
 	}
 
 	w = spdk_jsonrpc_begin_result(request);
-	if (w == NULL) {
-		return;
-	}
-
 	spdk_json_write_array_begin(w);
 
 	for (i = 0; i < SPDK_SCSI_MAX_DEVS; i++) {
@@ -67,11 +63,9 @@ spdk_rpc_get_scsi_devices(struct spdk_jsonrpc_request *request,
 
 		spdk_json_write_object_begin(w);
 
-		spdk_json_write_name(w, "id");
-		spdk_json_write_int32(w, dev->id);
+		spdk_json_write_named_int32(w, "id", dev->id);
 
-		spdk_json_write_name(w, "device_name");
-		spdk_json_write_string(w, dev->name);
+		spdk_json_write_named_string(w, "device_name", dev->name);
 
 		spdk_json_write_object_end(w);
 	}
@@ -79,4 +73,5 @@ spdk_rpc_get_scsi_devices(struct spdk_jsonrpc_request *request,
 
 	spdk_jsonrpc_end_result(request, w);
 }
-SPDK_RPC_REGISTER("get_scsi_devices", spdk_rpc_get_scsi_devices, SPDK_RPC_RUNTIME)
+SPDK_RPC_REGISTER("scsi_get_devices", spdk_rpc_scsi_get_devices, SPDK_RPC_RUNTIME)
+SPDK_RPC_REGISTER_ALIAS_DEPRECATED(scsi_get_devices, get_scsi_devices)

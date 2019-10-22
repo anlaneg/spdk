@@ -34,29 +34,24 @@
 #include "spdk/stdinc.h"
 
 #include "spdk_cunit.h"
+#include "spdk_internal/mock.h"
 
+#include "common/lib/test_env.c"
 #include "nvmf/ctrlr_discovery.c"
 #include "nvmf/subsystem.c"
 
 SPDK_LOG_REGISTER_COMPONENT("nvmf", SPDK_LOG_NVMF)
 
-uint32_t
-spdk_env_get_current_core(void)
-{
-	return 0;
-}
+DEFINE_STUB_V(spdk_bdev_module_release_bdev,
+	      (struct spdk_bdev *bdev));
 
-struct spdk_event *
-spdk_event_allocate(uint32_t core, spdk_event_fn fn, void *arg1, void *arg2)
-{
-	return NULL;
-}
+DEFINE_STUB(spdk_bdev_get_block_size, uint32_t,
+	    (const struct spdk_bdev *bdev), 512);
 
-void
-spdk_event_call(struct spdk_event *event)
-{
-
-}
+DEFINE_STUB(spdk_nvmf_transport_stop_listen,
+	    int,
+	    (struct spdk_nvmf_transport *transport,
+	     const struct spdk_nvme_transport_id *trid), 0);
 
 int
 spdk_bdev_open(struct spdk_bdev *bdev, bool write, spdk_bdev_remove_cb_t remove_cb,
@@ -100,11 +95,10 @@ spdk_nvmf_transport_listener_discover(struct spdk_nvmf_transport *transport,
 static struct spdk_nvmf_transport g_transport = {};
 
 struct spdk_nvmf_transport *
-spdk_nvmf_transport_create(struct spdk_nvmf_tgt *tgt,
-			   enum spdk_nvme_transport_type type)
+spdk_nvmf_transport_create(enum spdk_nvme_transport_type type,
+			   struct spdk_nvmf_transport_opts *tprt_opts)
 {
 	if (type == SPDK_NVME_TRANSPORT_RDMA) {
-		g_transport.tgt = tgt;
 		return &g_transport;
 	}
 
@@ -121,12 +115,6 @@ struct spdk_nvmf_transport *
 spdk_nvmf_tgt_get_transport(struct spdk_nvmf_tgt *tgt, enum spdk_nvme_transport_type trtype)
 {
 	return &g_transport;
-}
-
-bool
-spdk_nvmf_transport_qpair_is_idle(struct spdk_nvmf_qpair *qpair)
-{
-	return false;
 }
 
 int
@@ -172,30 +160,31 @@ spdk_nvmf_poll_group_update_subsystem(struct spdk_nvmf_poll_group *group,
 
 int
 spdk_nvmf_poll_group_add_subsystem(struct spdk_nvmf_poll_group *group,
-				   struct spdk_nvmf_subsystem *subsystem)
+				   struct spdk_nvmf_subsystem *subsystem,
+				   spdk_nvmf_poll_group_mod_done cb_fn, void *cb_arg)
 {
 	return 0;
 }
 
-int
+void
 spdk_nvmf_poll_group_remove_subsystem(struct spdk_nvmf_poll_group *group,
-				      struct spdk_nvmf_subsystem *subsystem)
+				      struct spdk_nvmf_subsystem *subsystem,
+				      spdk_nvmf_poll_group_mod_done cb_fn, void *cb_arg)
 {
-	return 0;
 }
 
-int
+void
 spdk_nvmf_poll_group_pause_subsystem(struct spdk_nvmf_poll_group *group,
-				     struct spdk_nvmf_subsystem *subsystem)
+				     struct spdk_nvmf_subsystem *subsystem,
+				     spdk_nvmf_poll_group_mod_done cb_fn, void *cb_arg)
 {
-	return 0;
 }
 
-int
+void
 spdk_nvmf_poll_group_resume_subsystem(struct spdk_nvmf_poll_group *group,
-				      struct spdk_nvmf_subsystem *subsystem)
+				      struct spdk_nvmf_subsystem *subsystem,
+				      spdk_nvmf_poll_group_mod_done cb_fn, void *cb_arg)
 {
-	return 0;
 }
 
 static void
@@ -204,17 +193,22 @@ test_discovery_log(void)
 	struct spdk_nvmf_tgt tgt = {};
 	struct spdk_nvmf_subsystem *subsystem;
 	uint8_t buffer[8192];
+	struct iovec iov;
 	struct spdk_nvmf_discovery_log_page *disc_log;
 	struct spdk_nvmf_discovery_log_page_entry *entry;
 	struct spdk_nvme_transport_id trid = {};
 
-	tgt.opts.max_subsystems = 1024;
-	tgt.subsystems = calloc(tgt.opts.max_subsystems, sizeof(struct spdk_nvmf_subsystem *));
+	iov.iov_base = buffer;
+	iov.iov_len = 8192;
+
+	tgt.max_subsystems = 1024;
+	tgt.subsystems = calloc(tgt.max_subsystems, sizeof(struct spdk_nvmf_subsystem *));
 	SPDK_CU_ASSERT_FATAL(tgt.subsystems != NULL);
 
 	/* Add one subsystem and verify that the discovery log contains it */
 	subsystem = spdk_nvmf_subsystem_create(&tgt, "nqn.2016-06.io.spdk:subsystem1",
 					       SPDK_NVMF_SUBTYPE_NVME, 0);
+	subsystem->allow_any_host = true;
 	SPDK_CU_ASSERT_FATAL(subsystem != NULL);
 
 	trid.trtype = SPDK_NVME_TRANSPORT_RDMA;
@@ -222,24 +216,26 @@ test_discovery_log(void)
 	snprintf(trid.traddr, sizeof(trid.traddr), "1234");
 	snprintf(trid.trsvcid, sizeof(trid.trsvcid), "5678");
 	SPDK_CU_ASSERT_FATAL(spdk_nvmf_subsystem_add_listener(subsystem, &trid) == 0);
+	subsystem->state = SPDK_NVMF_SUBSYSTEM_ACTIVE;
 
 	/* Get only genctr (first field in the header) */
 	memset(buffer, 0xCC, sizeof(buffer));
 	disc_log = (struct spdk_nvmf_discovery_log_page *)buffer;
-	spdk_nvmf_get_discovery_log_page(&tgt, buffer, 0, sizeof(disc_log->genctr));
+	spdk_nvmf_get_discovery_log_page(&tgt, "nqn.2016-06.io.spdk:host1", &iov, 1, 0,
+					 sizeof(disc_log->genctr));
 	CU_ASSERT(disc_log->genctr == 1); /* one added subsystem */
 
 	/* Get only the header, no entries */
 	memset(buffer, 0xCC, sizeof(buffer));
 	disc_log = (struct spdk_nvmf_discovery_log_page *)buffer;
-	spdk_nvmf_get_discovery_log_page(&tgt, buffer, 0, sizeof(*disc_log));
+	spdk_nvmf_get_discovery_log_page(&tgt, "nqn.2016-06.io.spdk:host1", &iov, 1, 0, sizeof(*disc_log));
 	CU_ASSERT(disc_log->genctr == 1);
 	CU_ASSERT(disc_log->numrec == 1);
 
 	/* Offset 0, exact size match */
 	memset(buffer, 0xCC, sizeof(buffer));
 	disc_log = (struct spdk_nvmf_discovery_log_page *)buffer;
-	spdk_nvmf_get_discovery_log_page(&tgt, buffer, 0,
+	spdk_nvmf_get_discovery_log_page(&tgt, "nqn.2016-06.io.spdk:host1", &iov, 1, 0,
 					 sizeof(*disc_log) + sizeof(disc_log->entries[0]));
 	CU_ASSERT(disc_log->genctr != 0);
 	CU_ASSERT(disc_log->numrec == 1);
@@ -248,7 +244,7 @@ test_discovery_log(void)
 	/* Offset 0, oversize buffer */
 	memset(buffer, 0xCC, sizeof(buffer));
 	disc_log = (struct spdk_nvmf_discovery_log_page *)buffer;
-	spdk_nvmf_get_discovery_log_page(&tgt, buffer, 0, sizeof(buffer));
+	spdk_nvmf_get_discovery_log_page(&tgt, "nqn.2016-06.io.spdk:host1", &iov, 1, 0, sizeof(buffer));
 	CU_ASSERT(disc_log->genctr != 0);
 	CU_ASSERT(disc_log->numrec == 1);
 	CU_ASSERT(disc_log->entries[0].trtype == 42);
@@ -258,13 +254,14 @@ test_discovery_log(void)
 	/* Get just the first entry, no header */
 	memset(buffer, 0xCC, sizeof(buffer));
 	entry = (struct spdk_nvmf_discovery_log_page_entry *)buffer;
-	spdk_nvmf_get_discovery_log_page(&tgt, buffer,
+	spdk_nvmf_get_discovery_log_page(&tgt, "nqn.2016-06.io.spdk:host1", &iov,
+					 1,
 					 offsetof(struct spdk_nvmf_discovery_log_page, entries[0]),
 					 sizeof(*entry));
 	CU_ASSERT(entry->trtype == 42);
+	subsystem->state = SPDK_NVMF_SUBSYSTEM_INACTIVE;
 	spdk_nvmf_subsystem_destroy(subsystem);
 	free(tgt.subsystems);
-	free(tgt.discovery_log_page);
 }
 
 int main(int argc, char **argv)
